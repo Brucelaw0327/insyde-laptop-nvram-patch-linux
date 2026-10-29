@@ -5,6 +5,8 @@
 这是 [insyde-laptop-nvram-patch](https://github.com/Brucelaw0327/insyde-laptop-nvram-patch)（Windows / H2OUVE 版）的 Linux 对照实现，为 **TIMI A7S / TM2037（Redmi G 2021 锐龙版，R7 5800H，Insyde H2O）** 实测通过。
 
 > ⚠️ **这会改固件 NVRAM。它可能让机器变砖。** 读 [DISCLAIMER.md](DISCLAIMER.md) 和 [docs/how-it-works.md](docs/how-it-works.md) 再动手。
+>
+> 🚀 **只想赶紧用起来？** 看 [QUICKSTART.md](QUICKSTART.md) —— 哪个命令在本机真能用、三种典型场景的照抄命令、退出码对照。下面是完整文档。
 
 ---
 

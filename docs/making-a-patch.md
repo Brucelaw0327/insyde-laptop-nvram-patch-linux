@@ -146,6 +146,8 @@ sudo insyde-nvram restore patches/my-setting.patch
 - 写 `Setup,Custom` 的意义是「连自定义默认值一起改」，这样下次 Load User Defaults 也不会把它带回来。
 - 但**同偏移旧值不同**时，取值门禁会报错并列出两边的值 —— 这是有意的：工具不会替你决定该覆盖哪一边。要写就分开写两个补丁，各自声明正确的 `FROM`。
 
+`diff` / `tpm --after` 自动生成的补丁**永远只含一个记录**：差异落在两个记录上时，会拆成 `<名字>.Setup.patch` 和 `<名字>.Custom.patch` 两份。理由在于 `apply` 的语义 —— 同一组偏移会套到 `RECORDS` 里的**每一条**记录上，所以把两个记录的改动合成一份，等于顺手改了另一份里你根本没动过的字节。
+
 ---
 
 ## 7. 一次一个 patch —— 本版与 Windows 版的差别

@@ -111,6 +111,22 @@ echo "== fTPM =="
 ./insyde-nvram tpm --after "$LAST" 2>&1 | grep -q "字节完全相同" && chk "after 正确报告无差异" 0 0 || chk "after 正确报告无差异" 0 1
 ./insyde-nvram tpm --after /nonexistent >/dev/null 2>&1;       chk "after 快照不存在"    2 $?
 
+echo "== diff 跨记录拆分 =="
+GUID_LINE="A04A27F4-DF00-4D42-B552-39511302113D"
+mkdir -p "$TMP/sb" "$TMP/sa1" "$TMP/sa2"
+cp "$LAST"/*.bin "$TMP/sb/"
+cp "$LAST"/*.bin "$TMP/sa1/"; cp "$LAST"/*.bin "$TMP/sa2/"
+printf '\x01' | dd of="$TMP/sa1/Setup.bin" bs=1 seek=256 conv=notrunc status=none
+printf '\x01' | dd of="$TMP/sa2/Setup.bin" bs=1 seek=256 conv=notrunc status=none
+printf '\x01' | dd of="$TMP/sa2/Custom.bin" bs=1 seek=256 conv=notrunc status=none
+./insyde-nvram diff "$TMP/sb" "$TMP/sa1" --guid "$GUID_LINE" --name d1 --out "$TMP/d1.patch" >/dev/null 2>&1
+[ -f "$TMP/d1.patch" ] && chk "单记录差异 → 1 份补丁" 0 0 || chk "单记录差异 → 1 份补丁" 0 1
+grep -q '^RECORDS  = Setup$' "$TMP/d1.patch" && chk "补丁 RECORDS 只含变动的记录" 0 0 || chk "补丁 RECORDS 只含变动的记录" 0 1
+./insyde-nvram diff "$TMP/sb" "$TMP/sa2" --guid "$GUID_LINE" --name d2 --out "$TMP/d2.patch" >/dev/null 2>&1
+{ [ -f "$TMP/d2.Setup.patch" ] && [ -f "$TMP/d2.Custom.patch" ]; } \
+    && chk "两个记录都变 → 拆成 2 份" 0 0 || chk "两个记录都变 → 拆成 2 份" 0 1
+./insyde-nvram check "$TMP/d2.Setup.patch" >/dev/null 2>&1; chk "拆出的补丁可被 check 解析" 0 $?
+
 echo
 echo "通过 $pass / 失败 $fail"
 rm -rf "$TMP"

@@ -910,6 +910,46 @@ def cmd_show(args):
     return EXIT_OK
 
 
+def _write_patch_for_record(out_path, name, guid, rec, changes, header):
+    lines = list(header)
+    lines += [
+        "NAME     = %s" % name,
+        "VARSTORE = SystemConfig",
+        "GUID     = %s" % guid,
+        "RECORDS  = %s" % rec,
+        "",
+    ]
+    for off, x, y in changes:
+        lines.append("CHANGE   = 0x%03X 0x%02X 0x%02X" % (off, x, y))
+    with open(out_path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+    return out_path
+
+
+def emit_candidate_patches(out_path, name, guid, per_record, header):
+    """一个记录写一份补丁，返回写出的文件列表。
+
+    绝不把多个记录的改动塞进同一份补丁：apply 会把同一组偏移套到
+    RECORDS 里的每一条记录上。合并写 = 顺手改了你没打算改的那一份。
+    """
+    recs = [r for r in sorted(per_record) if per_record[r]]
+    if not recs:
+        return []
+    if not guid:
+        return []
+    if len(recs) == 1:
+        return [_write_patch_for_record(out_path, name, guid, recs[0],
+                                        per_record[recs[0]], header)]
+    stem, ext = os.path.splitext(out_path)
+    ext = ext or ".patch"
+    outs = []
+    for r in recs:
+        p = "%s.%s%s" % (stem, r, ext)
+        outs.append(_write_patch_for_record(p, "%s [%s]" % (name, r), guid, r,
+                                            per_record[r], header))
+    return outs
+
+
 def cmd_diff(args):
     a = _load_snapshot(args.old)
     b = _load_snapshot(args.new)
@@ -917,7 +957,7 @@ def cmd_diff(args):
     if not common:
         die(EXIT_PATCH, "两份快照没有同名记录可比")
     total = 0
-    stub = []
+    per_record = {}
     for name in common:
         da, db = a[name], b[name]
         if len(da) != len(db):
@@ -931,28 +971,30 @@ def cmd_diff(args):
         for off, x, y in diffs:
             ctx = da[max(0, off - 4):off + 5]
             say("   0x%03x  %02x -> %02x   上下文 %s" % (off, x, y, ctx.hex(" ")))
-            stub.append((off, x, y))
+        per_record[name] = diffs
         total += len(diffs)
     say("")
     say("合计 %d 处差异" % total)
     if total and args.out:
-        guid_line = ("GUID     = %s" % args.guid.upper()) if args.guid \
-            else "GUID     = <填变量存储的 GUID>"
-        lines = [
+        header = [
             "# 由 `insyde-nvram diff` 生成 —— 保存前逐行核对，尤其确认 TO 是你想要的值。",
             "# 差分法只证明「改了之后这些字节变了」，不证明这些字节就是你以为的那个设置项。",
             "# 验证方式：改回去再快照一次，差异应当只剩这几处。",
-            "NAME     = %s" % (args.name or "diff-candidate"),
-            "VARSTORE = SystemConfig",
-            guid_line,
-            "RECORDS  = %s" % ",".join(common),
-            "",
         ]
-        for off, x, y in stub:
-            lines.append("CHANGE   = 0x%03X 0x%02X 0x%02X" % (off, x, y))
-        with open(args.out, "w", encoding="utf-8") as fh:
-            fh.write("\n".join(lines) + "\n")
-        say("候选补丁已写出: %s" % args.out)
+        if not args.guid:
+            say("")
+            say("没有 --guid，未写补丁。变量存储的 GUID 用 `list` 查，然后重跑并带上 --guid。")
+            return EXIT_OK
+        outs = emit_candidate_patches(args.out, args.name or "diff-candidate",
+                                      args.guid.upper(), per_record, header)
+        if len(outs) == 1:
+            say("候选补丁已写出: %s" % outs[0])
+        else:
+            say("差异落在 %d 个记录，已拆成 %d 份补丁（一份只动一个记录）:" % (len(outs), len(outs)))
+            for p in outs:
+                say("   %s" % p)
+            say("  为什么要拆：apply 会把同一组偏移套到 RECORDS 里每条记录上，")
+            say("  合成一份就等于连你没动过的那份也一起改了。")
         say("  注意：如果两份快照之间在 BIOS 里改了不止一项，这里会混在一起 —— 一次只改一项。")
     return EXIT_OK
 
@@ -1153,7 +1195,7 @@ def _tpm_after(args):
     say("")
     say("== 字节差异（基线 -> 当前） ==")
     total = 0
-    stub = []
+    per_record = {}
     for name in sorted(baseline):
         try:
             _a, live = read_var(guid, name)
@@ -1172,7 +1214,7 @@ def _tpm_after(args):
         say("  %-10s %d 处" % (name, len(diffs)))
         for off, x, y in diffs:
             say("     0x%03x  %02x -> %02x" % (off, x, y))
-            stub.append((name, off, x, y))
+        per_record[name] = diffs
         total += len(diffs)
 
     say("")
@@ -1185,24 +1227,20 @@ def _tpm_after(args):
         say("VERDICT: 字节变了，但 fTPM 还没起来 —— 别急着下结论：")
         say("         AMD 上 fTPM 首次启用通常要完全断电（拔电/长按电源 10s）冷启动才会生效")
 
-    if stub and args.out:
-        recs = [n for n in baseline]
-        lines = [
+    if total and args.out:
+        header = [
             "# 由 `insyde-nvram tpm --after` 生成",
             "# 前提：基线之后只动过 BIOS 里 fTPM 那一项。若不成立，这些字节不可信。",
             "# 期望效果：应用后 ACPI 出现 TPM2 表、出现 /dev/tpm0",
-            "NAME     = ftpm-on",
-            "VARSTORE = SystemConfig",
-            "GUID     = %s" % guid,
-            "RECORDS  = %s" % ",".join(recs),
-            "",
         ]
-        for name, off, x, y in stub:
-            lines.append("CHANGE   = 0x%03X 0x%02X 0x%02X  # %s" % (off, x, y, name))
-        with open(args.out, "w", encoding="utf-8") as fh:
-            fh.write("\n".join(lines) + "\n")
+        outs = emit_candidate_patches(args.out, "ftpm-on", guid, per_record, header)
         say("")
-        say("候选补丁: %s" % args.out)
+        if len(outs) == 1:
+            say("候选补丁: %s" % outs[0])
+        else:
+            say("差异落在 %d 个记录，已拆成 %d 份补丁:" % (len(outs), len(outs)))
+            for p in outs:
+                say("   %s" % p)
         say("  它只是「这些字节变了」，不等于「这些字节就是 fTPM」。")
         say("  想验证：把补丁改回去（用反方向 apply）再进 BIOS 开一次，看差异是否仍是这几处。")
     return EXIT_OK
