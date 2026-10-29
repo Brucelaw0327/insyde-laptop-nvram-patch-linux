@@ -38,6 +38,8 @@ Secure Boot           关闭
 TPM                   未暴露（fTPM 关闭，/dev/tpm0 不存在）
 加密卷                无 LUKS
 引导                  Limine（efibootmgr 里有 Windows / OpenCore / Limine 三项）
+写入通道              **Setup 被固件写保护**：write() 返回 EROFS = EFI_WRITE_PROTECTED
+                      （open 成功、write 被拒，`probe --scan` 可复核；见第 9 节）
 ```
 
 两条记录**内容不完全相同**：`0x061 / 0x066 / 0x0A8 / 0x226` 四处不一致（这是「当前设置」与「用户自定义默认值」的差别）。所以补丁默认只写 `Setup`；如果你确实要连 `Custom` 一起改，先看 [docs/making-a-patch.md](docs/making-a-patch.md) 第 6 节。
@@ -66,11 +68,13 @@ sudo insyde-nvram apply patches/xxx.patch --dry-run   # 4 跑完所有门禁但�
 sudo insyde-nvram apply patches/xxx.patch             # 4 真的写
 sudo insyde-nvram restore patches/xxx.patch           # 5 逐字节回滚
 sudo insyde-nvram probe --record Setup                # 6 通道探针（原样写回）
+sudo insyde-nvram probe --scan                        # 6 通道扫描（分清哪种封锁）
+insyde-nvram export patches/xxx.patch --out export/x  # 7 离线导出（换通道时用）
 ```
 
 `./run.sh` 是菜单前端，对应原仓库的 `run.cmd`。
 
-**先跑 `probe`。** efivarfs 能读不代表能写：`Setup` 变量在 efivarfs 里带 `immutable` inode 标志，而且有些 Insyde 固件会把普通 SetVariable 直接拒掉。`probe` 只把**当前字节原样写回**再比对 —— 它不改任何值，失败也没有副作用，但它能提前告诉你这条路通不通。
+**先跑 `probe`。** efivarfs 能读不代表能写：`Setup` 变量在 efivarfs 里带 `immutable` inode 标志，而且固件可以用 `EFI_WRITE_PROTECTED` 直接驳回对它的 `SetVariable`（本机就是这种情况，报错文字会显示成 `Read-only file system`）。`probe` 只把**当前字节原样写回**再比对 —— 它不改任何值，失败也没有副作用，但它能提前告诉你这条路通不通。
 
 ---
 
@@ -171,13 +175,39 @@ sudo insyde-nvram restore patches/xxx.patch
 
 ## 9. 通道被拦怎么办
 
-`probe` 报 `WRITE_BLOCKED`，说明固件不接受普通 SetVariable 写这个变量。三条备选路，按代价排序：
+**本机实测结论（2026-10-30）**：`Setup` 变量写入返回 `EFI_WRITE_PROTECTED`，内核把它映射成 `EROFS`，所以报错文字是 `Read-only file system`（跟文件系统无关）。`open()` 是成功的，被拒的是 `write()` —— 也就是固件在 `SetVariable` 里驳回了这条变量。这正是 H2OUVE 的 SMI 通道存在的理由。
 
-1. **换通道，不换工具**：把同一份补丁拿到 Windows 侧，用原仓库的 `H2OUVE` 走 SMI 服务写。这台机器上有 Windows 分区，是最省事的一条。
-2. **UEFI Shell + H2OUVE.efi / RU.EFI**：`RU.EFI` 能直接改任意变量，代价是得手动算偏移，而且要 U 盘。原仓库刻意不分发 H2OUVE，这里也不分发。
-3. **GRUB 的 `setup_var`**：需要在 U 盘里装一份带该模块的 GRUB，启动时改内存里的 Setup 数据，固件在下次开机时把它落盘。本机引导是 Limine，没有 GRUB，所以这条路要先准备 U 盘。
+先分清是哪种封锁：
 
-不要在没有回滚手段的情况下反复试。
+```bash
+sudo insyde-nvram probe --scan
+```
+
+它会做两件事，结果写进 `logs/channel.json`（`status` 会显示）：
+
+- 建一个一次性变量 `InsydeNvramProbe` 再删掉 → 判断**普通 SetVariable 通不通**
+- 逐个写回每个 Setup 类变量的原字节 → 判断**哪几条被单独保护**
+
+| 扫描结果 | 含义 | 出路 |
+|---|---|---|
+| 临时变量失败 | 整条 efivarfs 写路径被封（固件没声明 SET_VARIABLE） | 只能换通道 |
+| 临时变量成功、`Setup` 失败 | 固件只保护了 `Setup` 这一条 | 其它标记「可用」的存储照常能 apply；`Setup` 换通道 |
+| 全部可用 | 通道没问题 | 直接 apply |
+
+换通道，按代价排序：
+
+1. **Windows + H2OUVE**（最省事，这台机器有 Windows 分区）。补丁文件格式完全通用，把 `patches/*.patch` 拷过去用原仓库的 `apply_patch.ps1` 写。
+2. **UEFI Shell + RU.EFI**。有些 Insyde 只在 runtime（虚拟模式）调用时拒绝，boot services 里执行的应用能写进去 —— 值得一试。手动按字节改，位置用下面 `export` 出的改动表。
+3. **GRUB 的 `setup_var`**。需要在 U 盘里装一份带该模块的 GRUB；本机引导是 Limine，没有 GRUB，所以要先准备 U 盘。
+4. **离线导出**（任何通道都能用，不含写入动作）：
+
+   ```bash
+   insyde-nvram export patches/xxx.patch --out export/xxx
+   # export/xxx/target.Setup.bin  完整的 700 字节目标值
+   # export/xxx/changes.txt       偏移 + 当前值 → 目标值 + 上下文
+   ```
+
+不要在没有回滚手段的情况下反复试。每换一条通道，先用它写回**原字节**验证通道，再写真实改动。
 
 ---
 
@@ -202,7 +232,8 @@ machine.sample.txt    手工模板
 patches/              补丁（仓库不预置，见 patches/README.md）
 snapshots/            每次 dump 的快照（.bin + dump.txt + vars_live.txt + meta.json）
 undo/                 原始字节副本（<slug>.<record>.bin 与 pre_* 审计副本）
-logs/                 apply / restore 的完整日志
+export/               export 的离线产物（target.*.bin + changes.txt）
+logs/                 apply / restore 的完整日志；logs/channel.json 记着上次探针结果
 tools/ifr_locate.py   从固件 IFR 定位偏移（原仓库脚本，未改）
 tools/ve_parse.py     解析 H2OUVE 格式转储（原仓库脚本，未改）
 docs/how-it-works.md  通道原理、为什么不刷 BIOS、为什么 poweroff

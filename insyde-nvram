@@ -328,6 +328,10 @@ def efivar_path(guid, name):
     return os.path.join(EFIVARS, "%s-%s" % (name, guid.lower()))
 
 
+class ChannelDenied(RuntimeError):
+    """固件/环境拒绝写入 —— 与「代码写错了」区分开，对应退出码 13。"""
+
+
 def read_var(guid, name):
     """返回 (attrs, data)。data 不含 4 字节属性头。"""
     path = efivar_path(guid, name)
@@ -375,38 +379,62 @@ def clear_immutable(path):
 
 
 def write_var(guid, name, data):
-    """整块写入变量数据。成功返回 None，失败抛 (code, msg)。"""
+    """整块写入变量数据。成功返回是否清过 immutable，失败抛 ChannelDenied/RuntimeError。"""
     path = efivar_path(guid, name)
     if not os.path.exists(path):
         raise RuntimeError("变量不存在: %s" % path)
     attrs, _ = read_var(guid, name)
     if attrs & 0x60:  # AUTHENTICATED_WRITE_ACCESS / TIME_BASED_AUTHENTICATED
-        raise RuntimeError(
+        raise ChannelDenied(
             "变量属性 0x%08x 带认证写入位，OS 侧不可能写入成功" % attrs)
     cleared = clear_immutable(path)
     try:
         fd = os.open(path, os.O_WRONLY)
     except OSError as e:
         if e.errno in (errno.EPERM, errno.EACCES):
-            raise RuntimeError(
+            raise ChannelDenied(
                 "打开失败 (%s)。两种可能：(1) 在容器/沙箱里跑，efivarfs 写入被外层拦住；"
-                "(2) 固件拒绝普通 SetVariable。先在真实 root shell 里试一次 probe，"
-                "再看 docs/how-it-works.md 的「通道被拦」一节" % e.strerror)
-        raise RuntimeError("打开 %s 失败: %s" % (path, e.strerror))
+                "(2) 固件拒绝普通 SetVariable。在真实 root shell 里跑 "
+                "`insyde-nvram probe --scan` 就能把两者分开。" % e.strerror)
+        raise ChannelDenied(classify_efi_error(e))
     try:
         n = os.write(fd, data)
         if n != len(data):
             raise RuntimeError("只写入 %d / %d 字节" % (n, len(data)))
     except OSError as e:
-        if e.errno in (errno.EIO, errno.EPERM, errno.EACCES, errno.ENOSPC, errno.EINVAL):
-            raise RuntimeError(
-                "固件拒绝了这次 SetVariable（errno=%s %s）。这是固件侧的写入保护，"
-                "不是权限问题，加 sudo 也没用。" % (errno.errorcode.get(e.errno, e.errno),
-                                              e.strerror))
-        raise RuntimeError("写入失败: %s" % e.strerror)
+        raise ChannelDenied(classify_efi_error(e))
     finally:
         os.close(fd)
     return cleared
+
+
+def classify_efi_error(e):
+    """把 errno 翻译成「固件到底说了什么」。
+
+    efivarfs 的写入错误码是内核把 EFI_STATUS 映射出来的结果，看着像 Linux 权限
+    问题，其实全是固件在回答。EOFS 是最容易被误读的一个：
+        EFI_WRITE_PROTECTED  ->  -EROFS   （"Read-only file system"，与文件系统无关）
+    """
+    code = errno.errorcode.get(e.errno, str(e.errno))
+    if e.errno == errno.EROFS:
+        return ("固件返回 EFI_WRITE_PROTECTED（内核映射成 EROFS=%s）：这个变量被固件"
+                "写保护。报错文字像「只读文件系统」，其实跟文件系统没关系 —— 普通 "
+                "SetVariable 在这条变量上被固件驳回，只有走 SMI 服务的通道"
+                "（H2OUVE）能改。见 README 第 9 节。" % code)
+    if e.errno in (errno.EIO,):
+        return ("固件返回 EFI 错误（ERRNO=%s，多半是 EFI_SECURITY_VIOLATION）："
+                "SetVariable 被拒。" % code)
+    if e.errno in (errno.EPERM, errno.EACCES):
+        return ("内核/固件拒绝写入（%s）。若 immutable 已清除仍失败，说明固件拦了"
+                "这条变量。" % code)
+    if e.errno == errno.EINVAL:
+        return ("数据不被接受（%s）：长度、属性或内容不合固件要求。" % code)
+    if e.errno == errno.EOPNOTSUPP:
+        return ("固件没有声明 SET_VARIABLE 运行时能力（%s）：efivarfs 整条写路径"
+                "在这台机器上不可用。" % code)
+    if e.errno == errno.ENOSPC:
+        return "固件报告变量空间不足（%s）。" % code
+    return "写入失败（%s %s）。" % (code, e.strerror)
 
 
 # ---------------------------------------------------------------------------
@@ -712,8 +740,19 @@ def cmd_status(args):
     say("")
 
     say("写入通道")
-    say("   状态   未测试。efivarfs 能读不代表能写 ——")
-    say("           `sudo insyde-nvram probe --record Setup`（只写回原字节，不改任何值）")
+    st = _load_channel_state()
+    if st:
+        say("   上次探针  %s" % st.get("time"))
+        for rec, verdict in sorted((st.get("records") or {}).items()):
+            say("     %-14s %s" % (rec, verdict))
+        usable = [r for r, v in (st.get("records") or {}).items() if v == "WRITE_OK"]
+        if usable:
+            say("   结论       可用记录: %s" % ", ".join(usable))
+        else:
+            say("   结论       efivarfs 写不进去 → 见 README 第 9 节的备选通道")
+    else:
+        say("   状态   未测试。efivarfs 能读不代表能写 ——")
+        say("           `sudo insyde-nvram probe --scan`（只写回原字节 + 一个临时变量）")
     if os.geteuid() != 0:
         say("   注意   当前不是 root，正式写入需要 sudo")
     return EXIT_OK
@@ -955,6 +994,8 @@ def cmd_check(args):
 def cmd_probe(args):
     """只把原字节写回，用于判定固件是否允许 OS 侧 SetVariable。"""
     gate_root()
+    if args.scan:
+        return probe_scan(args)
     stores = discover_setup_stores()
     guid = args.guid.upper() if args.guid else None
     if not guid:
@@ -978,9 +1019,10 @@ def cmd_probe(args):
         cleared = write_var(guid, args.record, data)
     except RuntimeError as e:
         say("")
-        say("写入失败: %s" % e)
+        say(str(e))
         say("")
         say("VERDICT: WRITE_BLOCKED")
+        _save_channel_state({args.record: "WRITE_BLOCKED"})
         return EXIT_CHANNEL_DENIED
     say("immutable 标志: %s" % ("已清除" if cleared else "无需清除"))
     _a2, after = read_var(guid, args.record)
@@ -988,6 +1030,7 @@ def cmd_probe(args):
         say("回读比对: 完全一致")
         say("")
         say("VERDICT: WRITE_OK —— efivarfs 通道可用，可以应用补丁")
+        _save_channel_state({args.record: "WRITE_OK"})
         return EXIT_OK
     diff = [i for i in range(min(len(data), len(after))) if data[i] != after[i]]
     say("回读比对: 不一致，%d 处" % len(diff))
@@ -995,7 +1038,227 @@ def cmd_probe(args):
         say("   0x%03X  %02x -> %02x" % (i, data[i], after[i]))
     say("")
     say("VERDICT: WRITE_MUTATED —— 写入被接受但固件改了字节，不要在这个通道上做真实改动")
+    _save_channel_state({args.record: "WRITE_MUTATED"})
     return EXIT_CHANNEL_MUTATED
+
+
+def _channel_state_path():
+    return os.path.join(LOGDIR, "channel.json")
+
+
+def _save_channel_state(results):
+    try:
+        os.makedirs(LOGDIR, exist_ok=True)
+        with open(_channel_state_path(), "w", encoding="utf-8") as fh:
+            json.dump({"time": time.strftime("%Y-%m-%d %H:%M:%S"), "records": results},
+                      fh, indent=2, ensure_ascii=False)
+    except OSError:
+        pass
+
+
+def _load_channel_state():
+    p = _channel_state_path()
+    if not os.path.exists(p):
+        return None
+    try:
+        with open(p, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def _scratch_var_test():
+    """造一个一次性变量再删掉，判断「普通 SetVariable 通不通」。
+
+    这一条把两种完全不同的失败区分开：
+      * 连临时变量都建不出来 → 整条 efivarfs 写路径被封（固件没声明 SET_VARIABLE）
+      * 临时变量没问题、只有 Setup 不行 → 固件只写保护了 Setup，别的存储还能改
+    """
+    guid = "1F0E7C3A-9B2D-4C58-8A41-6D2E5B90317C"
+    name = "InsydeNvramProbe"
+    path = efivar_path(guid, name)
+    payload = b"insyde-nvram probe"
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        try:
+            os.write(fd, (0x07).to_bytes(4, "little") + payload)
+        finally:
+            os.close(fd)
+    except OSError as e:
+        return False, classify_efi_error(e)
+    try:
+        raw = open(path, "rb").read()
+    except OSError as e:
+        return False, "读回失败: %s" % e.strerror
+    ok = raw[4:] == payload
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+    return ok, ("创建/读回/删除全部成功" if ok else "写进去了但读回不一致")
+
+
+def _short_reason(msg, limit=72):
+    """把长解释压成一行，保留最像原因的那半句。"""
+    msg = str(msg).strip().replace("\n", " ")
+    cut = msg.find("。")
+    if 0 < cut <= limit:
+        return msg[:cut]
+    return msg[:limit] + ("…" if len(msg) > limit else "")
+
+
+def probe_scan(args):
+    """扫一遍：普通 SetVariable 通不通 + 每个 Setup 类记录通不通。"""
+    say("通道扫描 —— 每一项都只写回原字节（或一个一次性临时变量），不改任何设置")
+    say("=" * 64)
+    if not args.yes:
+        ans = input("输入 SCAN 继续: ").strip()
+        if ans != "SCAN":
+            say("已取消")
+            return EXIT_PATCH
+
+    say("")
+    say("[1] 普通 SetVariable（建一个 InsydeNvramProbe 临时变量，验完即删）")
+    ok, msg = _scratch_var_test()
+    say("    %s  %s" % ("通过" if ok else "失败", msg))
+    general_ok = ok
+    say("")
+
+    say("[2] 各个 Setup 类变量（写回原字节）")
+    stores = discover_setup_stores()
+    targets = []
+    for guid, recs in sorted(stores.items()):
+        for r in recs:
+            if r["name"] in SETUP_NAMES:
+                targets.append((guid, r))
+    if not targets:
+        say("    没找到 Setup 类变量")
+    results = {}
+    for guid, r in targets:
+        name, attrs = r["name"], r["attrs"]
+        label = "%s / %s" % (guid, name)
+        if attrs & 0x60:
+            say("    %-52s 跳过（attrs=0x%02x 带认证位，OS 侧写不了）" % (label, attrs))
+            results[name] = "SKIP_AUTH"
+            continue
+        try:
+            _a, data = read_var(guid, name)
+            write_var(guid, name, data)
+            _b, after = read_var(guid, name)
+        except RuntimeError as e:
+            say("    %-52s 拒绝  %s" % (label, _short_reason(e)))
+            results[name] = "WRITE_BLOCKED"
+            continue
+        if after == data:
+            say("    %-52s 可用（回读一致）" % label)
+            results[name] = "WRITE_OK"
+        else:
+            say("    %-52s 写入被接受但字节被改（%d 处）"
+                % (label, sum(1 for i in range(min(len(data), len(after)))
+                              if data[i] != after[i])))
+            results[name] = "WRITE_MUTATED"
+
+    _save_channel_state(results)
+    say("")
+    say("=" * 64)
+    if general_ok and any(v == "WRITE_OK" for v in results.values()):
+        say("结论：efivarfs 通道整体可用，标记为「可用」的记录能直接 apply。")
+    elif general_ok:
+        say("结论：普通 SetVariable 可用，但 Setup 类变量全部被写保护 ——")
+        say("      这不是权限或内核问题，是固件在拒绝。走 README 第 9 节的备选通道。")
+    else:
+        say("结论：连临时变量都写不进去，整条 efivarfs 写路径在这台机器上不可用 ——")
+        say("      可能是固件没声明 SET_VARIABLE 运行时能力。走 README 第 9 节。")
+    say("结果已存入 logs/channel.json（status 会显示）")
+    return EXIT_CHANNEL_DENIED if not any(v.startswith("WRITE_OK") for v in results.values()) \
+        else EXIT_OK
+
+
+def build_target(patch, live):
+    """目标数据 = 实机当前字节 + 恰好这些改动。同时做合理性检查。
+
+    返回 {record: bytes}；不满足「目标字节确实是 TO」时抛 RuntimeError。
+    """
+    target = {}
+    for rec, data in live.items():
+        buf = bytearray(data)
+        for c in patch["changes"]:
+            buf[c["off"]] = c["to"]
+        target[rec] = bytes(buf)
+        for c in patch["changes"]:
+            if buf[c["off"]] != c["to"]:
+                raise RuntimeError("合理性检查失败: %s 0x%03X 未变成 0x%02X"
+                                   % (rec, c["off"], c["to"]))
+    return target
+
+
+def cmd_export(args):
+    """离线导出目标字节 + 改动表，给 RU.EFI / H2OUVE 之类的手工通道用。"""
+    p = parse_patch(args.patch)
+    if not p["ok"]:
+        die(EXIT_PATCH, "补丁有问题: %s" % p["err"])
+    live = {}
+    for rec in p["records"]:
+        try:
+            _a, live[rec] = read_var(p["guid"], rec)
+        except RuntimeError as e:
+            die(EXIT_ENGINE, str(e))
+
+    # 导出的目标值是「实机当前字节 + 改动」算出来的，所以旧值必须对得上，
+    # 否则导出的东西就是基于错误前提的产物 —— 手工通道里没人会替你再核一遍。
+    bad = []
+    for rec in p["records"]:
+        for c in p["changes"]:
+            cur = live[rec][c["off"]] if c["off"] < len(live[rec]) else None
+            if cur != c["from"]:
+                bad.append("   %s 0x%03X 当前 %s，补丁要求 FROM 0x%02X"
+                           % (rec, c["off"],
+                              "越界" if cur is None else "0x%02X" % cur, c["from"]))
+    if bad:
+        say("取值对不上，不导出：")
+        for b in bad:
+            say(b)
+        die(EXIT_LAYOUT, "先确认偏移和旧值（`insyde-nvram check`），别把错的带进手工通道。")
+
+    try:
+        target = build_target(p, live)
+    except RuntimeError as e:
+        die(EXIT_SANITY, str(e))
+
+    outdir = args.out or os.path.join(HERE, "export", p["slug"])
+    os.makedirs(outdir, exist_ok=True)
+    lines = []
+    for rec in p["records"]:
+        fn = os.path.join(outdir, "target.%s.bin" % rec)
+        with open(fn, "wb") as fh:
+            fh.write(target[rec])
+        say("目标字节  %s  (%d 字节)" % (fn, len(target[rec])))
+
+    lines.append("# %s" % p["name"])
+    lines.append("# GUID    %s" % p["guid"])
+    lines.append("# 记录    %s" % ", ".join(p["records"]))
+    lines.append("# 生成于  %s" % time.strftime("%Y-%m-%d %H:%M:%S"))
+    lines.append("")
+    lines.append("# 手动写入时，把下面每一行的当前值改成目标值（偏移不含 efivarfs 属性头）")
+    for rec in p["records"]:
+        lines.append("")
+        lines.append("[%s]" % rec)
+        for c in p["changes"]:
+            lo = max(0, c["off"] - 4)
+            hi = min(len(live[rec]), c["off"] + 5)
+            lines.append("  0x%03X  %02X -> %02X     上下文 %s"
+                         % (c["off"], live[rec][c["off"]], c["to"],
+                            live[rec][lo:hi].hex(" ")))
+    lines.append("")
+    lines.append("# 设备/位置：变量存储 %s，记录 %s" % (p["guid"], ", ".join(p["records"])))
+    lines.append("# 写完必须完全关机（poweroff）再开机，设置项在开机早期被固件消费。")
+    txt = os.path.join(outdir, "changes.txt")
+    with open(txt, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+    say("改动表    %s" % txt)
+    say("")
+    say("离线导出不含任何写入动作。用法见 README 第 9 节。")
+    return EXIT_OK
 
 
 def cmd_apply(args):
@@ -1028,17 +1291,11 @@ def cmd_apply(args):
     gate_values(p, live, args.force)
 
     # 目标数据
-    target = {}
-    for rec, data in live.items():
-        buf = bytearray(data)
-        for c in p["changes"]:
-            buf[c["off"]] = c["to"]
-        target[rec] = bytes(buf)
-        for c in p["changes"]:
-            if bytes(buf[c["off"]:c["off"] + 1]) != bytes([c["to"]]):
-                flush_log(logpath)
-                die(EXIT_SANITY, "合理性检查失败: %s 0x%03X 未变成 0x%02X"
-                    % (rec, c["off"], c["to"]))
+    try:
+        target = build_target(p, live)
+    except RuntimeError as e:
+        flush_log(logpath)
+        die(EXIT_SANITY, str(e))
 
     say("")
     say("将要发生的改动：")
@@ -1079,13 +1336,14 @@ def cmd_apply(args):
         say("写入      %s …" % rec)
         try:
             cleared = write_var(p["guid"], rec, target[rec])
+        except ChannelDenied as e:
+            say("   失败: %s" % e)
+            flush_log(logpath)
+            die(EXIT_CHANNEL_DENIED,
+                "通道被拦（退出码 13）。先跑 `sudo insyde-nvram probe --scan` 确认是"
+                "整条 efivarfs 被封、还是只有这条变量被写保护，然后按 README 第 9 节换通道。")
         except RuntimeError as e:
             say("   失败: %s" % e)
-            if "固件拒绝" in str(e):
-                flush_log(logpath)
-                die(EXIT_CHANNEL_DENIED,
-                    "通道被拦：固件不接受普通 SetVariable 写这个变量。"
-                    "改用 docs/how-it-works.md 里的备选通道。")
             flush_log(logpath)
             die(EXIT_ENGINE, str(e))
         if cleared:
@@ -1156,9 +1414,13 @@ def cmd_restore(args):
                 return EXIT_PATCH
         try:
             write_var(p["guid"], rec, orig)
+        except ChannelDenied as e:
+            say("   失败: %s" % e)
+            flush_log(logpath)
+            die(EXIT_CHANNEL_DENIED, str(e))
         except RuntimeError as e:
             flush_log(logpath)
-            die(EXIT_CHANNEL_DENIED if "固件拒绝" in str(e) else EXIT_ENGINE, str(e))
+            die(EXIT_ENGINE, str(e))
         _a, after = read_var(p["guid"], rec)
         if after == orig:
             say("   %s 已恢复并校验一致" % rec)
@@ -1228,9 +1490,16 @@ def build_parser():
     s.add_argument("--yes", action="store_true")
     s.set_defaults(func=cmd_restore)
 
+    s = sub.add_parser("export", help="离线导出目标字节与改动表（给 RU.EFI / H2OUVE 用）")
+    s.add_argument("patch")
+    s.add_argument("--out")
+    s.set_defaults(func=cmd_export)
+
     s = sub.add_parser("probe", help="写通道探针：原样写回，不改任何值")
     s.add_argument("--record", default="Setup")
     s.add_argument("--guid")
+    s.add_argument("--scan", action="store_true",
+                   help="扫描全部 Setup 类变量 + 临时变量，判断是整条通道被封还是单变量被保护")
     s.add_argument("--yes", action="store_true")
     s.set_defaults(func=cmd_probe)
 

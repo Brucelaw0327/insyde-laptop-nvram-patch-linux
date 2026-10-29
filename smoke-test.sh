@@ -98,6 +98,12 @@ sed -i 's/^BIOS=.*/BIOS=WRONGVERSION/' machine.txt
 ./insyde-nvram apply "$TMP/ok.patch" --dry-run >/dev/null 2>&1;       chk "身份门禁"  7 $?
 cp "$TMP/machine.txt.keep" machine.txt
 
+echo "== 离线导出 =="
+./insyde-nvram export "$TMP/ok.patch" --out "$TMP/exp" >/dev/null 2>&1;      chk "export 正常"        0 $?
+[ -f "$TMP/exp/target.Setup.bin" ] && chk "export 产出 target.bin" 0 0 || chk "export 产出 target.bin" 0 1
+./insyde-nvram export "$TMP/bad-from.patch" --out "$TMP/exp2" >/dev/null 2>&1; chk "export 旧值不匹配"   8 $?
+./insyde-nvram export "$TMP/no-guid.patch" --out "$TMP/exp3" >/dev/null 2>&1;  chk "export 补丁解析"     2 $?
+
 echo
 echo "通过 $pass / 失败 $fail"
 rm -rf "$TMP"

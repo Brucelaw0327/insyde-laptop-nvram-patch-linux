@@ -50,7 +50,8 @@ while true; do
     say "  3) 检查补丁               只读：这个补丁会动哪个字节，现在是几"
     say "  4) 应用补丁               写 NVRAM（多重门禁 + 逐字节校验）"
     say "  5) 回滚                   按 undo 副本写回原始字节"
-    say "  6) 写通道探针             把原字节原样写回，判断固件让不让写"
+    say "  6) 通道扫描               分清「整条通道被封」还是「只有 Setup 被保护」"
+    say "  7) 离线导出               算出目标字节，给 RU.EFI / H2OUVE 手工通道用"
     say "  0) 退出"
     hr
     printf '选择: '
@@ -104,10 +105,17 @@ while true; do
             sudo "$BIN" restore "$PICKED"
             ;;
         6)
-            printf '目标记录名（回车用 Setup）: '
-            read -r rec
-            [ -z "$rec" ] && rec="Setup"
-            sudo "$BIN" probe --record "$rec"
+            sudo "$BIN" probe --scan
+            ;;
+        7)
+            pick_patch || continue
+            printf '导出到 export/ 下的目录名（回车用补丁名）: '
+            read -r ename
+            if [ -z "$ename" ]; then
+                "$BIN" export "$PICKED"
+            else
+                "$BIN" export "$PICKED" --out "$HERE/export/$ename"
+            fi
             ;;
         0|q|Q)
             exit 0
