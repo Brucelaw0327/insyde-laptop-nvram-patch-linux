@@ -52,6 +52,7 @@ while true; do
     say "  5) 回滚                   按 undo 副本写回原始字节"
     say "  6) 通道扫描               分清「整条通道被封」还是「只有 Setup 被保护」"
     say "  7) 离线导出               算出目标字节，给 RU.EFI / H2OUVE 手工通道用"
+    say "  8) fTPM                   判定开没开；打基线 → BIOS 开一次 → 对比"
     say "  0) 退出"
     hr
     printf '选择: '
@@ -116,6 +117,23 @@ while true; do
             else
                 "$BIN" export "$PICKED" --out "$HERE/export/$ename"
             fi
+            ;;
+        8)
+            "$BIN" tpm
+            hr
+            say "  1) 打基线快照（之后去 BIOS 里开 fTPM）"
+            say "  2) 已从 BIOS 回来，对比并判定"
+            printf '选择（回车跳过）: '
+            read -r t
+            case "$t" in
+                1) "$BIN" tpm --baseline ;;
+                2)
+                    printf '基线快照目录: '
+                    read -r tbase
+                    [ -z "$tbase" ] && continue
+                    "$BIN" tpm --after "$tbase" --out "$HERE/patches/ftpm-on.patch"
+                    ;;
+            esac
             ;;
         0|q|Q)
             exit 0

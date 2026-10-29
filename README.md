@@ -35,7 +35,8 @@
   Setup               700 字节  attrs=0x07 (NV|BS|RT)
   Custom              700 字节  attrs=0x07 (NV|BS|RT)
 Secure Boot           关闭
-TPM                   未暴露（fTPM 关闭，/dev/tpm0 不存在）
+TPM                   fTPM 关闭（固件层）：无 /dev/tpm0、ACPI 无 TPM2/TCPA 表、
+                      SMBIOS 无 Type 43；内核 tpm_crb 是 builtin，排除驱动因素
 加密卷                无 LUKS
 引导                  Limine（efibootmgr 里有 Windows / OpenCore / Limine 三项）
 写入通道              **Setup 被固件写保护**：write() 返回 EROFS = EFI_WRITE_PROTECTED
@@ -70,6 +71,7 @@ sudo insyde-nvram restore patches/xxx.patch           # 5 逐字节回滚
 sudo insyde-nvram probe --record Setup                # 6 通道探针（原样写回）
 sudo insyde-nvram probe --scan                        # 6 通道扫描（分清哪种封锁）
 insyde-nvram export patches/xxx.patch --out export/x  # 7 离线导出（换通道时用）
+insyde-nvram tpm                        # 8 fTPM 状态判定 / 开启实验（第 12 节）
 ```
 
 `./run.sh` 是菜单前端，对应原仓库的 `run.cmd`。
@@ -239,3 +241,38 @@ tools/ve_parse.py     解析 H2OUVE 格式转储（原仓库脚本，未改）
 docs/how-it-works.md  通道原理、为什么不刷 BIOS、为什么 poweroff
 docs/making-a-patch.md 补丁格式、定位纪律、一次一个 patch 的理由
 ```
+
+---
+
+## 12. fTPM 状态与开启
+
+```bash
+insyde-nvram tpm              # 只读：判定 fTPM 到底开没开
+insyde-nvram tpm --baseline   # 打基线，并打印实验步骤
+sudo insyde-nvram tpm --after snapshots/<基线> --out patches/ftpm-on.patch
+```
+
+`tpm` 不猜，只看固件说了什么，三条互相独立的证据：
+
+| 证据 | 关着的样子 | 开着的样子 |
+|---|---|---|
+| `/sys/class/tpm/tpm0`、`/dev/tpm0` | 不存在 | 存在 |
+| ACPI 表 `TPM2` / `TCPA` | **整张表都没有** | 有 |
+| SMBIOS Type 43（TPM Device） | 没有这条记录 | 有 |
+
+本机（TIMI A7S）三条全落在左边，而且内核里 `tpm_crb` 是 **builtin** —— 所以不是「驱动没加载」，是固件压根没向系统描述 TPM。判定的关键差别在这儿：
+
+- ACPI 有 `TPM2` 表但没设备节点 → 固件开了，系统没接上，查驱动，**别动 NVRAM**
+- 三样都没有 → 固件层就是关的，只能从 setup 里改
+
+### 打开它，三条路
+
+1. **BIOS 里直接开**（如果 setup 里看得见 TPM / Security Device / AMD fTPM switch）。有就直接开，用不着这个工具。
+2. **差分实验**（推荐，也是唯一能同时拿到偏移的办法）：`tpm --baseline` → 重启进 BIOS **只改 fTPM 这一项** → 保存 → 回系统跑 `tpm --after`。它会告诉你两件事：字节差在哪、fTPM 到底起来没有。事后想反悔或者想批量部署，这几处字节就是一条补丁。
+3. **改 NVRAM 写进去**：得有偏移（来自 2 或 IFR）＋一条能写的通道。本机写通道被固件拦着，这条路目前不通，见第 9 节。
+
+### 两个坑
+
+- **AMD 上 fTPM 首次启用要完全断电**（`poweroff` 或长按电源 10 秒），`reboot` 常常不够：PSP 得在冷启动时才会去初始化 fTPM。所以 `tpm --after` 报「字节变了但 TPM 还没起来」时先别下结论，先冷启动一次再看。
+- **BitLocker / LUKS-TPM2 绑着的时候别动 fTPM**：清 fTPM 或换状态会触发恢复密钥。本机目前没有 LUKS，也没有 TPM2 token，所以是安全的。想给 LUKS 绑 TPM2：`systemd-cryptenroll --tpm2-device=auto --tpm2-pcrs=0+7 <设备>`。
+

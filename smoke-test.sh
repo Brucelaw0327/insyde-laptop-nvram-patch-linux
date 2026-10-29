@@ -104,6 +104,13 @@ echo "== 离线导出 =="
 ./insyde-nvram export "$TMP/bad-from.patch" --out "$TMP/exp2" >/dev/null 2>&1; chk "export 旧值不匹配"   8 $?
 ./insyde-nvram export "$TMP/no-guid.patch" --out "$TMP/exp3" >/dev/null 2>&1;  chk "export 补丁解析"     2 $?
 
+echo "== fTPM =="
+./insyde-nvram tpm >/dev/null 2>&1;                            chk "tpm 状态判定"        0 $?
+./insyde-nvram tpm --baseline >/dev/null 2>&1;                 chk "tpm --baseline"      0 $?
+./insyde-nvram tpm --after "$LAST" >/dev/null 2>&1;            chk "tpm --after 同一状态" 0 $?
+./insyde-nvram tpm --after "$LAST" 2>&1 | grep -q "字节完全相同" && chk "after 正确报告无差异" 0 0 || chk "after 正确报告无差异" 0 1
+./insyde-nvram tpm --after /nonexistent >/dev/null 2>&1;       chk "after 快照不存在"    2 $?
+
 echo
 echo "通过 $pass / 失败 $fail"
 rm -rf "$TMP"

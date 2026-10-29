@@ -48,6 +48,7 @@ HERE = os.path.dirname(os.path.realpath(__file__))
 SNAPDIR = os.path.join(HERE, "snapshots")
 UNDODIR = os.path.join(HERE, "undo")
 LOGDIR = os.path.join(HERE, "logs")
+LAST_SNAPDIR = None      # 由 cmd_dump 填充，供 tpm --baseline 复用
 MACHINE = os.path.join(HERE, "machine.txt")
 
 EXIT_OK = 0
@@ -838,6 +839,8 @@ def cmd_dump(args):
     label = args.label or "dump"
     outdir = os.path.join(SNAPDIR, "%s_%s" % (_stamp(), re.sub(r"[^\w.-]+", "_", label)))
     os.makedirs(outdir, exist_ok=True)
+    global LAST_SNAPDIR
+    LAST_SNAPDIR = outdir
 
     if args.guid:
         guid = args.guid.upper()
@@ -989,6 +992,228 @@ def cmd_check(args):
     say("结论: %s" % {EXIT_OK: "可以应用", EXIT_LAYOUT: "偏移/取值对不上，别写",
                      EXIT_BLIND: "有记录读不到"}.get(rc, "异常"))
     return rc
+
+
+# ---------------------------------------------------------------------------
+# fTPM：状态判定 + 「打开 fTPM」差分实验
+# ---------------------------------------------------------------------------
+
+ACPI_TABLES = "/sys/firmware/acpi/tables"
+DMI_ENTRIES = "/sys/firmware/dmi/entries"
+
+
+def tpm_evidence():
+    """收集固件层关于 TPM 的证据。只读，不需要 root。"""
+    ev = {"nodes": [], "acpi": [], "smbios43": False,
+          "driver": [], "dmesg": [], "notes": []}
+
+    for p in ("/sys/class/tpm/tpm0", "/dev/tpm0", "/dev/tpmrm0"):
+        if os.path.exists(p):
+            ev["nodes"].append(p)
+
+    for name in ("TPM2", "TCPA"):
+        p = os.path.join(ACPI_TABLES, name)
+        if os.path.exists(p):
+            try:
+                ev["acpi"].append("%s (%d B)" % (name, os.path.getsize(p)))
+            except OSError:
+                ev["acpi"].append(name)
+
+    if os.path.isdir(DMI_ENTRIES):
+        try:
+            ev["smbios43"] = any(n.startswith("43-") for n in os.listdir(DMI_ENTRIES))
+        except OSError:
+            pass
+
+    # 内核侧有没有驱动：决定「以后真开了 fTPM，系统能不能用上」
+    base = "/lib/modules/%s/kernel/drivers/char/tpm" % os.uname().release
+    if os.path.isdir(base):
+        try:
+            ev["driver"] = sorted(n for n in os.listdir(base) if "crb" in n or n.startswith("tpm_tis"))
+        except OSError:
+            pass
+    if _have("modinfo"):
+        try:
+            r = subprocess.run(["modinfo", "tpm_crb"], capture_output=True, text=True, timeout=5)
+            if r.returncode == 0 and "(builtin)" in r.stdout:
+                ev["driver"].append("tpm_crb=builtin")
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    try:
+        r = subprocess.run(["dmesg"], capture_output=True, text=True, timeout=5)
+        if r.returncode == 0:
+            ev["dmesg"] = [l.strip() for l in r.stdout.splitlines()
+                           if re.search(r"tpm|ftpm|crb", l, re.I)][:8]
+        else:
+            ev["notes"].append("dmesg 需要 root，内核日志已跳过")
+    except (OSError, subprocess.SubprocessError):
+        ev["notes"].append("dmesg 不可用，内核日志已跳过")
+    return ev
+
+
+def tpm_verdict(ev):
+    """返回 (state, 说明行)。state: ON / FIRMWARE_ON_KERNEL_OFF / OFF。"""
+    if ev["nodes"]:
+        return "ON", ["设备节点存在: %s" % ", ".join(ev["nodes"])]
+    if ev["acpi"]:
+        return "FIRMWARE_ON_KERNEL_OFF", [
+            "固件已经把 TPM 描述给系统（ACPI: %s），但没有出现设备节点" % ", ".join(ev["acpi"]),
+            "这是「固件开着、系统没接上」，和「BIOS 里关着」是两回事，先查驱动而不是改 NVRAM",
+        ]
+    why = ["SMBIOS Type 43（TPM Device）: %s"
+           % ("有" if ev["smbios43"] else "连这一条都没有")]
+    why.append("ACPI 表里没有 TPM2 / TCPA")
+    why.append("结论：固件根本没有向系统描述任何 TPM —— fTPM 在 setup 里是关的")
+    return "OFF", why
+
+
+def cmd_tpm(args):
+    ev = tpm_evidence()
+    state, why = tpm_verdict(ev)
+
+    say("== 固件层证据 ==")
+    say("  TPM 设备节点    %s" % (", ".join(ev["nodes"]) if ev["nodes"]
+                                  else "无（/sys/class/tpm 为空）"))
+    say("  ACPI 表         %s" % (", ".join(ev["acpi"]) if ev["acpi"] else "无 TPM2 / TCPA"))
+    say("  SMBIOS Type 43  %s" % ("有" if ev["smbios43"] else "无"))
+    say("  内核驱动        %s" % (", ".join(dict.fromkeys(ev["driver"]))
+                                  if ev["driver"] else "没找到"))
+    for l in ev["dmesg"]:
+        say("  dmesg           %s" % l)
+    for n in ev["notes"]:
+        say("  备注            %s" % n)
+    say("")
+    say("== 判定 ==")
+    for l in why:
+        say("  " + l)
+    say("")
+
+    if state == "ON":
+        say("VERDICT: fTPM 已开启")
+        if _have("systemd-cryptenroll"):
+            say("  想给 LUKS 绑 TPM2: systemd-cryptenroll --tpm2-device=auto --tpm2-pcrs=0+7 <设备>")
+        return EXIT_OK
+
+    if state == "FIRMWARE_ON_KERNEL_OFF":
+        say("VERDICT: 固件开了但内核没接上（不是 NVRAM 问题，别改 setup 变量）")
+        return EXIT_ENGINE
+
+    say("VERDICT: fTPM 关闭（固件层，不是驱动问题）")
+    say("")
+    say("打开它有三条路，按代价排：")
+    say("  1. BIOS 里直接开（最省事）—— 如果 setup 里看得见 TPM/fTPM 这一项")
+    say("  2. 差分实验 —— 你在 BIOS 里开一次，本工具对比出到底是哪个字节变了，")
+    say("     以后这一项就能写成补丁，不用再进 BIOS。见下面 --baseline / --after")
+    say("  3. 改 NVRAM 写进去 —— 需要先知道偏移（来自 2 或 IFR），且需要可用写通道")
+    say("")
+    if not (_channel_ok()):
+        say("  注意：本机写通道此前判定为被固件拦截，第 3 条路目前走不通。")
+
+    if args.baseline:
+        say("")
+        say("== 打基线快照 ==")
+        rc = cmd_dump(argparse.Namespace(label="ftpm-before",
+                                         guid=args.guid, record=None))
+        if rc != EXIT_OK:
+            return rc
+        say("")
+        say("接下来：重启进 BIOS，把 fTPM / Security Device / AMD fTPM switch 打开并保存，")
+        say("再回到系统执行：")
+        say("    sudo ./insyde-nvram tpm --after %s --out patches/ftpm-on.patch"
+            % (LAST_SNAPDIR or "<上面的快照目录>"))
+        say("只改这一项，别的什么都别动 —— 否则 diff 出的一堆字节分不清哪个是 fTPM。")
+
+    elif args.after:
+        return _tpm_after(args)
+    return EXIT_OK
+
+
+def _tpm_after(args):
+    """对比基线快照与当前 live，并给出「fTPM 是否真的开了」的判定。"""
+    baseline = _load_snapshot(args.after)
+    meta_path = os.path.join(args.after if os.path.isdir(args.after) else "",
+                             "meta.json")
+    guid = args.guid.upper() if args.guid else None
+    if not guid and os.path.isfile(meta_path):
+        try:
+            guid = json.load(open(meta_path, encoding="utf-8")).get("guid", "").upper() or None
+        except (OSError, ValueError):
+            pass
+    if not guid:
+        die(EXIT_PATCH, "读不出基线的 GUID，用 --guid 指定")
+
+    say("")
+    say("== 固件层复查 ==")
+    ev = tpm_evidence()
+    state, why = tpm_verdict(ev)
+    for l in why:
+        say("  " + l)
+
+    say("")
+    say("== 字节差异（基线 -> 当前） ==")
+    total = 0
+    stub = []
+    for name in sorted(baseline):
+        try:
+            _a, live = read_var(guid, name)
+        except RuntimeError as e:
+            say("  %-10s 读不到: %s" % (name, e))
+            continue
+        old = baseline[name]
+        if len(old) != len(live):
+            say("  %-10s 长度变了 %d -> %d（布局变化，偏移不可沿用）"
+                % (name, len(old), len(live)))
+        diffs = [(i, old[i], live[i]) for i in range(min(len(old), len(live)))
+                 if old[i] != live[i]]
+        if not diffs:
+            say("  %-10s 字节完全相同" % name)
+            continue
+        say("  %-10s %d 处" % (name, len(diffs)))
+        for off, x, y in diffs:
+            say("     0x%03x  %02x -> %02x" % (off, x, y))
+            stub.append((name, off, x, y))
+        total += len(diffs)
+
+    say("")
+    if state == "ON":
+        say("VERDICT: fTPM 已经开了 —— 实验成功")
+    elif total == 0:
+        say("VERDICT: 什么都没变。要么 BIOS 里那一步没保存，要么这一项不落在")
+        say("         这个变量里（换 GUID 再试，见 list 的输出）")
+    else:
+        say("VERDICT: 字节变了，但 fTPM 还没起来 —— 别急着下结论：")
+        say("         AMD 上 fTPM 首次启用通常要完全断电（拔电/长按电源 10s）冷启动才会生效")
+
+    if stub and args.out:
+        recs = [n for n in baseline]
+        lines = [
+            "# 由 `insyde-nvram tpm --after` 生成",
+            "# 前提：基线之后只动过 BIOS 里 fTPM 那一项。若不成立，这些字节不可信。",
+            "# 期望效果：应用后 ACPI 出现 TPM2 表、出现 /dev/tpm0",
+            "NAME     = ftpm-on",
+            "VARSTORE = SystemConfig",
+            "GUID     = %s" % guid,
+            "RECORDS  = %s" % ",".join(recs),
+            "",
+        ]
+        for name, off, x, y in stub:
+            lines.append("CHANGE   = 0x%03X 0x%02X 0x%02X  # %s" % (off, x, y, name))
+        with open(args.out, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+        say("")
+        say("候选补丁: %s" % args.out)
+        say("  它只是「这些字节变了」，不等于「这些字节就是 fTPM」。")
+        say("  想验证：把补丁改回去（用反方向 apply）再进 BIOS 开一次，看差异是否仍是这几处。")
+    return EXIT_OK
+
+
+def _channel_ok():
+    st = _load_channel_state()
+    if not st:
+        return True          # 没测过，不做断言
+    recs = st.get("records") or {}
+    return any(v == "WRITE_OK" for v in recs.values())
 
 
 def cmd_probe(args):
@@ -1494,6 +1719,15 @@ def build_parser():
     s.add_argument("patch")
     s.add_argument("--out")
     s.set_defaults(func=cmd_export)
+
+    s = sub.add_parser("tpm", help="fTPM 状态判定 + 打开 fTPM 的差分实验")
+    s.add_argument("--baseline", action="store_true",
+                   help="先打一份基线快照，并打印实验步骤")
+    s.add_argument("--after", metavar="快照目录",
+                   help="BIOS 里开过之后回来对比基线，判定是否生效并生成候选补丁")
+    s.add_argument("--out", help="配合 --after 写出候选补丁")
+    s.add_argument("--guid")
+    s.set_defaults(func=cmd_tpm)
 
     s = sub.add_parser("probe", help="写通道探针：原样写回，不改任何值")
     s.add_argument("--record", default="Setup")
