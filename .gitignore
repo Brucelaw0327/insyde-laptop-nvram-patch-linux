@@ -1,0 +1,14 @@
+# 本机生成，不进版本库
+machine.txt
+
+# 转储、原始字节副本、日志
+snapshots/
+undo/
+logs/
+
+# 用户自己的补丁（格式见 docs/making-a-patch.md）
+patches/*.patch
+!patches/README.md
+
+__pycache__/
+*.pyc

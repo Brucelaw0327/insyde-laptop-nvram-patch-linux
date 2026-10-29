@@ -1,0 +1,1251 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""insyde-nvram -- Insyde H2O 笔记本 NVRAM 补丁工具（Linux / efivarfs 版）
+
+这是 Windows 版 insyde-laptop-nvram-patch 的 Linux 对照实现：
+  * 补丁文件格式完全相同（NAME / VARSTORE / GUID / RECORDS / OFFSET+FROM+TO 或 CHANGE）
+  * 身份门禁、逐字节回滚、写入后读回校验的逻辑保持一致
+  * 写入通道由 H2OUVE 的 SMI 服务改成内核 efivarfs（SetVariable）
+
+差别（因为平台不同，不是简化）：
+  * 没有 H2OUVE、没有 segwindrv 内核驱动、没有"最小记录文件"。
+    SetVariable 一次写整个变量数据，所以写入内容 = 当前字节 + 恰好这些改动。
+  * BitLocker 门禁换成 LUKS/TPM2 密封卷门禁：凡是把密钥密封进 TPM 的卷，都拒绝写入。
+  * 偏移一律指"变量数据内的偏移"（不含 efivarfs 的 4 字节属性头）。
+
+退出码（与 Windows 版对齐，新增 13/14）：
+  0  成功
+  1  写入后校验失败
+  2  补丁文件/参数错误
+  3  未以 root 运行
+  4  当前值不可读（盲写）
+  5  合理性检查失败（目标数据不含预期值）
+  6  缺少 machine.txt（写引擎绝不自己生成）
+  7  身份门禁不匹配
+  8  布局/取值门禁不匹配
+  9  后端读写失败
+  11 存在 TPM 密封的加密卷
+  12 无法判定加密状态
+  13 固件拒绝 OS 侧写入（通道被拦）
+  14 写入被接受但字节被固件改写
+"""
+
+import argparse
+import errno
+import fcntl
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+VERSION = "1.0.0"
+
+EFIVARS = "/sys/firmware/efi/efivars"
+HERE = os.path.dirname(os.path.realpath(__file__))
+SNAPDIR = os.path.join(HERE, "snapshots")
+UNDODIR = os.path.join(HERE, "undo")
+LOGDIR = os.path.join(HERE, "logs")
+MACHINE = os.path.join(HERE, "machine.txt")
+
+EXIT_OK = 0
+EXIT_VERIFY = 1
+EXIT_PATCH = 2
+EXIT_NOT_ROOT = 3
+EXIT_BLIND = 4
+EXIT_SANITY = 5
+EXIT_NO_MACHINE = 6
+EXIT_IDENTITY = 7
+EXIT_LAYOUT = 8
+EXIT_ENGINE = 9
+EXIT_ENC_LOCKED = 11
+EXIT_ENC_UNKNOWN = 12
+EXIT_CHANNEL_DENIED = 13
+EXIT_CHANNEL_MUTATED = 14
+
+# Insyde 的 Setup 变量存储通常就这两个记录名；只用于发现与展示，不预置任何偏移。
+SETUP_NAMES = ("Setup", "Custom", "SetupData", "CustomDefaults")
+
+FS_IOC_GETFLAGS = 0x80086601
+FS_IOC_SETFLAGS = 0x40086602
+FS_IMMUTABLE_FL = 0x00000010
+
+GUID_RE = re.compile(
+    r"^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"
+)
+
+_LOG = []
+
+
+def say(msg=""):
+    print(msg)
+    _LOG.append(str(msg))
+
+
+def flush_log(path):
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(_LOG) + "\n")
+        say("日志      = %s" % path)
+    except OSError:
+        pass
+
+
+def die(code, msg):
+    say(msg)
+    raise SystemExit(code)
+
+
+# ---------------------------------------------------------------------------
+# 身份
+# ---------------------------------------------------------------------------
+
+def _read_text(path):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+def live_identity():
+    """与 Windows 版 HKLM\\HARDWARE\\DESCRIPTION\\System\\BIOS 的三项对应。
+
+    Windows                     Linux (/sys/class/dmi/id)
+    BIOSVersion                 bios_version
+    BaseBoardProduct            board_name
+    SystemProductName           product_name
+    """
+    d = "/sys/class/dmi/id"
+    return {
+        "BIOS": _read_text(os.path.join(d, "bios_version")),
+        "BOARD": _read_text(os.path.join(d, "board_name")),
+        "MODEL": _read_text(os.path.join(d, "product_name")),
+    }
+
+
+def live_identity_extended():
+    d = "/sys/class/dmi/id"
+    return {
+        "vendor": _read_text(os.path.join(d, "sys_vendor")),
+        "model": _read_text(os.path.join(d, "product_name")),
+        "sku": _read_text(os.path.join(d, "product_sku")),
+        "board": _read_text(os.path.join(d, "board_name")),
+        "bios_vendor": _read_text(os.path.join(d, "bios_vendor")),
+        "bios_version": _read_text(os.path.join(d, "bios_version")),
+        "bios_date": _read_text(os.path.join(d, "bios_date")),
+    }
+
+
+def read_machine_file():
+    """machine.txt 只装身份，不装偏移。占位符 <...> 视为空。"""
+    out = {"BIOS": None, "BOARD": None, "MODEL": None}
+    if not os.path.exists(MACHINE):
+        return out
+    for line in open(MACHINE, "r", encoding="utf-8", errors="replace"):
+        t = line.strip()
+        if not t or t.startswith("#") or "=" not in t:
+            continue
+        k, v = t.split("=", 1)
+        k = k.strip().upper()
+        v = v.strip()
+        v = re.sub(r"\s+#.*$", "", v).strip()
+        if k in out:
+            out[k] = None if re.match(r"^<.*>$", v) else v
+    return out
+
+
+def seed_machine_file():
+    """只在文件完全不存在时生成（与 Windows 版一致：写引擎绝不生成配置）。"""
+    if os.path.exists(MACHINE):
+        return False
+    ident = live_identity()
+    if not all(ident.values()):
+        return False
+    lines = [
+        "# machine.txt -- 记录/补丁构建时本机的身份。由 `insyde-nvram status` 首次运行时",
+        "# 自动生成（仅当文件不存在）。写引擎只会读它，绝不生成或补全。",
+        "#",
+        "# Windows 版的对应关系：",
+        "#   BIOS  = HKLM\\HARDWARE\\DESCRIPTION\\System\\BIOS\\BIOSVersion",
+        "#   BOARD = ...\\BaseBoardProduct",
+        "#   MODEL = ...\\SystemProductName",
+        "",
+        "BIOS=%s" % ident["BIOS"],
+        "BOARD=%s" % ident["BOARD"],
+        "MODEL=%s" % ident["MODEL"],
+        "",
+        "# 这个文件只做身份闸门。要改哪个字节，写在 patches/*.patch 里。",
+    ]
+    with open(MACHINE, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+    return True
+
+
+# ---------------------------------------------------------------------------
+# 补丁文件解析（与 lib/patchfile.ps1 行为一致）
+# ---------------------------------------------------------------------------
+
+def read_kv_file(path):
+    kv = {}
+    if not path or not os.path.exists(path):
+        return kv
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            t = line.strip()
+            if not t or t.startswith("#") or t.startswith(";"):
+                continue
+            eq = t.find("=")
+            if eq < 0:
+                continue
+            k = t[:eq].strip().upper()
+            v = t[eq + 1:].strip()
+            v = re.sub(r"\s+#.*$", "", v).strip()
+            if not k:
+                continue
+            if k in kv:
+                kv[k] = (kv[k] if isinstance(kv[k], list) else [kv[k]]) + [v]
+            else:
+                kv[k] = v
+    return kv
+
+
+def parse_hex(s):
+    if s is None:
+        return -1
+    t = re.sub(r"^0[xX]", "", str(s).strip())
+    if not re.match(r"^[0-9A-Fa-f]+$", t):
+        return -1
+    try:
+        return int(t, 16)
+    except ValueError:
+        return -1
+
+
+def patch_slug(patch):
+    n = ""
+    if patch.get("path"):
+        n = os.path.splitext(os.path.basename(patch["path"]))[0]
+    elif patch.get("name"):
+        n = patch["name"]
+    n = re.sub(r"[^A-Za-z0-9_.-]+", "_", n).strip("_")
+    return (n or "default").lower()
+
+
+def parse_patch(path):
+    r = {"ok": False, "err": "", "name": "", "varstore": "", "guid": "",
+         "records": [], "changes": [], "path": "", "slug": "", "size": None}
+    if not path:
+        r["err"] = "没有指定补丁文件"
+        return r
+    if not os.path.exists(path):
+        r["err"] = "找不到补丁文件: %s" % path
+        return r
+    kv = read_kv_file(path)
+
+    r["name"] = kv.get("NAME") or os.path.splitext(os.path.basename(path))[0]
+    r["varstore"] = kv.get("VARSTORE") or ""
+    r["path"] = os.path.realpath(path)
+    r["slug"] = patch_slug(r)
+
+    if not kv.get("GUID"):
+        r["err"] = "缺少 GUID（变量存储的 GUID）"
+        return r
+    g = str(kv["GUID"]).strip().strip("{}")
+    if not GUID_RE.match(g):
+        r["err"] = "GUID 不是 xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx 形式: %s" % g
+        return r
+    r["guid"] = g.upper()
+
+    if kv.get("RECORDS"):
+        r["records"] = [x.strip() for x in str(kv["RECORDS"]).split(",") if x.strip()]
+    elif kv.get("RECORD"):
+        r["records"] = [str(kv["RECORD"]).strip()]
+    if not r["records"]:
+        r["err"] = '缺少 RECORDS（逗号分隔的记录名，例如 "Setup"）'
+        return r
+
+    if kv.get("SIZE") is not None:
+        sz = parse_hex(kv["SIZE"])
+        if sz <= 0:
+            r["err"] = "SIZE 不是合法的十六进制长度: %s" % kv["SIZE"]
+            return r
+        r["size"] = sz
+
+    changes = []
+    if "CHANGE" in kv:
+        if "OFFSET" in kv or "FROM" in kv or "TO" in kv:
+            r["err"] = "OFFSET/FROM/TO 与 CHANGE 行只能选一种，不能混用"
+            return r
+        items = kv["CHANGE"] if isinstance(kv["CHANGE"], list) else [kv["CHANGE"]]
+        for c in items:
+            tk = [x for x in re.split(r"\s+", str(c).strip()) if x]
+            if len(tk) != 3:
+                r["err"] = 'CHANGE 需要 "OFFSET FROM TO" 三个值，实际: %s' % c
+                return r
+            o, f, t = parse_hex(tk[0]), parse_hex(tk[1]), parse_hex(tk[2])
+            if min(o, f, t) < 0:
+                r["err"] = "CHANGE 里有非十六进制值: %s" % c
+                return r
+            changes.append({"off": o, "from": f, "to": t})
+    else:
+        o = parse_hex(kv.get("OFFSET"))
+        f = parse_hex(kv.get("FROM"))
+        t = parse_hex(kv.get("TO"))
+        if min(o, f, t) < 0:
+            r["err"] = "OFFSET / FROM / TO 三者都要有（十六进制），或改用 CHANGE 行"
+            return r
+        changes.append({"off": o, "from": f, "to": t})
+
+    seen = {}
+    for c in changes:
+        if c["off"] in seen:
+            r["err"] = "偏移 0x%X 出现了不止一次" % c["off"]
+            return r
+        seen[c["off"]] = True
+        if c["from"] > 0xFF or c["to"] > 0xFF:
+            r["err"] = ("偏移 0x%X: FROM/TO 必须是单个字节 (0x00-0xFF)，实际 0x%X / 0x%X"
+                        % (c["off"], c["from"], c["to"]))
+            return r
+        if c["from"] == c["to"]:
+            r["err"] = ("偏移 0x%X: FROM 与 TO 都是 0x%02X —— 什么也没改"
+                        % (c["off"], c["from"]))
+            return r
+
+    r["changes"] = sorted(changes, key=lambda x: x["off"])
+    r["ok"] = True
+    return r
+
+
+# ---------------------------------------------------------------------------
+# efivarfs 后端
+# ---------------------------------------------------------------------------
+
+def efivar_path(guid, name):
+    return os.path.join(EFIVARS, "%s-%s" % (name, guid.lower()))
+
+
+def read_var(guid, name):
+    """返回 (attrs, data)。data 不含 4 字节属性头。"""
+    path = efivar_path(guid, name)
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read()
+    except OSError as e:
+        raise RuntimeError("读取 %s 失败: %s" % (path, e.strerror))
+    if len(raw) < 4:
+        raise RuntimeError("%s 长度异常 (%d 字节)" % (path, len(raw)))
+    return int.from_bytes(raw[:4], "little"), raw[4:]
+
+
+def _get_inode_flags(path):
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        return int.from_bytes(fcntl.ioctl(fd, FS_IOC_GETFLAGS, b"\x00" * 4), "little")
+    finally:
+        os.close(fd)
+
+
+def _set_inode_flags(path, flags):
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        fcntl.ioctl(fd, FS_IOC_SETFLAGS, flags.to_bytes(4, "little"))
+    finally:
+        os.close(fd)
+
+
+def clear_immutable(path):
+    """efivarfs 会把变量标成 inode immutable，写之前必须清掉（等效 chattr -i）。"""
+    try:
+        flags = _get_inode_flags(path)
+    except OSError as e:
+        raise RuntimeError("读 inode 标志失败: %s" % e.strerror)
+    if not flags & FS_IMMUTABLE_FL:
+        return False
+    try:
+        _set_inode_flags(path, flags & ~FS_IMMUTABLE_FL)
+    except OSError as e:
+        raise RuntimeError(
+            "清除 immutable 标志失败（需要 CAP_LINUX_IMMUTABLE，且不能在容器里跑）: %s"
+            % e.strerror)
+    return True
+
+
+def write_var(guid, name, data):
+    """整块写入变量数据。成功返回 None，失败抛 (code, msg)。"""
+    path = efivar_path(guid, name)
+    if not os.path.exists(path):
+        raise RuntimeError("变量不存在: %s" % path)
+    attrs, _ = read_var(guid, name)
+    if attrs & 0x60:  # AUTHENTICATED_WRITE_ACCESS / TIME_BASED_AUTHENTICATED
+        raise RuntimeError(
+            "变量属性 0x%08x 带认证写入位，OS 侧不可能写入成功" % attrs)
+    cleared = clear_immutable(path)
+    try:
+        fd = os.open(path, os.O_WRONLY)
+    except OSError as e:
+        if e.errno in (errno.EPERM, errno.EACCES):
+            raise RuntimeError(
+                "打开失败 (%s)。两种可能：(1) 在容器/沙箱里跑，efivarfs 写入被外层拦住；"
+                "(2) 固件拒绝普通 SetVariable。先在真实 root shell 里试一次 probe，"
+                "再看 docs/how-it-works.md 的「通道被拦」一节" % e.strerror)
+        raise RuntimeError("打开 %s 失败: %s" % (path, e.strerror))
+    try:
+        n = os.write(fd, data)
+        if n != len(data):
+            raise RuntimeError("只写入 %d / %d 字节" % (n, len(data)))
+    except OSError as e:
+        if e.errno in (errno.EIO, errno.EPERM, errno.EACCES, errno.ENOSPC, errno.EINVAL):
+            raise RuntimeError(
+                "固件拒绝了这次 SetVariable（errno=%s %s）。这是固件侧的写入保护，"
+                "不是权限问题，加 sudo 也没用。" % (errno.errorcode.get(e.errno, e.errno),
+                                              e.strerror))
+        raise RuntimeError("写入失败: %s" % e.strerror)
+    finally:
+        os.close(fd)
+    return cleared
+
+
+# ---------------------------------------------------------------------------
+# 环境探测
+# ---------------------------------------------------------------------------
+
+def secure_boot_state():
+    try:
+        _a, d = read_var("8BE4DF61-93CA-11D2-AA0D-00E098032B8C", "SecureBoot")
+        return "开启" if d and d[0] else "关闭"
+    except RuntimeError:
+        return "未知"
+
+
+def tpm_present():
+    for p in ("/sys/class/tpm/tpm0", "/dev/tpm0", "/dev/tpmrm0"):
+        if os.path.exists(p):
+            return True
+    try:
+        out = subprocess.run(["lsmod"], capture_output=True, text=True, timeout=5).stdout
+        return bool(re.search(r"^tpm_", out, re.M))
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def discover_setup_stores():
+    """找出名字像 Setup 的变量，按 GUID 归组。不预置任何 GUID。"""
+    stores = {}
+    if not os.path.isdir(EFIVARS):
+        return stores
+    for fn in os.listdir(EFIVARS):
+        m = re.match(r"^(.+)-([0-9a-fA-F-]{36})$", fn)
+        if not m:
+            continue
+        name, guid = m.group(1), m.group(2)
+        stores.setdefault(guid.upper(), [])
+        try:
+            attrs, data = read_var(guid, name)
+        except RuntimeError:
+            continue
+        stores[guid.upper()].append({"name": name, "size": len(data), "attrs": attrs})
+    for guid in list(stores):
+        stores[guid].sort(key=lambda x: x["name"])
+    return stores
+
+
+def detect_tpm_sealed_volumes():
+    """返回 (state, detail_list)。state: 'none' | 'sealed' | 'unknown'。"""
+    detail = []
+    devs = []
+    try:
+        out = subprocess.run(
+            ["lsblk", "-J", "-o", "NAME,PATH,TYPE,FSTYPE"],
+            capture_output=True, text=True, timeout=10)
+        if out.returncode != 0:
+            return "unknown", ["lsblk 执行失败，无法枚举块设备"]
+        tree = json.loads(out.stdout or "{}")
+    except FileNotFoundError:
+        return "unknown", ["系统里没有 lsblk，无法枚举块设备"]
+    except (subprocess.SubprocessError, ValueError) as e:
+        return "unknown", ["枚举块设备失败: %s" % e]
+
+    def walk(nodes):
+        for n in nodes or []:
+            if (n.get("fstype") or "").lower() == "crypto_luks" and n.get("path"):
+                devs.append(n["path"])
+            walk(n.get("children"))
+
+    walk(tree.get("blockdevices"))
+
+    if not devs:
+        return "none", ["没有 crypto_LUKS 卷"]
+
+    if not _have("cryptsetup"):
+        return "unknown", ["存在 LUKS 卷但没装 cryptsetup，无法判定是否绑了 TPM2"]
+
+    state = "none"
+    for d in devs:
+        try:
+            r = subprocess.run(["cryptsetup", "luksDump", "--dump-json-metadata", d],
+                               capture_output=True, text=True, timeout=15)
+        except (OSError, subprocess.SubprocessError) as e:
+            detail.append("%s: 读取元数据失败 (%s)" % (d, e))
+            state = "unknown"
+            continue
+        if r.returncode != 0:
+            detail.append("%s: cryptsetup 返回 %d" % (d, r.returncode))
+            state = "unknown"
+            continue
+        try:
+            meta = json.loads(r.stdout)
+        except ValueError:
+            detail.append("%s: 元数据不是合法 JSON" % d)
+            state = "unknown"
+            continue
+        tokens = meta.get("tokens") or {}
+        tpm_tokens = [k for k, v in tokens.items()
+                      if "tpm2" in str(tokens.get(k, {}).get("type", "")).lower()]
+        if tpm_tokens:
+            detail.append("%s: TPM2 密封 token %s —— 关闭/改动 fTPM 会导致无法自动解锁"
+                          % (d, ",".join(tpm_tokens)))
+            state = "sealed"
+        else:
+            detail.append("%s: 仅口令/keyfile，未绑 TPM2" % d)
+    return state, detail
+
+
+def _have(cmd):
+    for p in os.environ.get("PATH", "/usr/bin:/bin:/usr/sbin:/sbin").split(":"):
+        if os.path.exists(os.path.join(p, cmd)):
+            return True
+    return False
+
+
+def hexdump(data, base=0, width=16):
+    lines = []
+    for off in range(0, len(data), width):
+        chunk = data[off:off + width]
+        hexpart = " ".join("%02x" % b for b in chunk)
+        hexpart = hexpart[:23] + " " + hexpart[23:] if len(chunk) > 8 else hexpart
+        asci = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
+        lines.append("%08x  %-49s |%s|" % (base + off, hexpart, asci))
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# 门禁
+# ---------------------------------------------------------------------------
+
+def gate_root():
+    if os.geteuid() != 0:
+        die(EXIT_NOT_ROOT, "没有 root 权限 —— 用 sudo 运行，或 ./run.sh 选项 4")
+
+
+def gate_machine(force):
+    ident = read_machine_file()
+    if not any(ident.values()):
+        if force:
+            say("门禁[身份] 缺少 machine.txt —— --force 跳过（危险）")
+            return
+        die(EXIT_NO_MACHINE,
+            "缺少 machine.txt。先运行 `insyde-nvram status` 生成基线，"
+            "写引擎不会自己编一个。")
+    live = live_identity()
+    bad = []
+    for k in ("BIOS", "BOARD", "MODEL"):
+        want, got = ident.get(k), live.get(k)
+        if want and want != got:
+            bad.append("   %-5s machine.txt=%-24s 本机=%s" % (k, want, got))
+        elif not want:
+            bad.append("   %-5s machine.txt 里是空占位符" % k)
+    if bad:
+        say("门禁[身份] 不匹配：")
+        for b in bad:
+            say(b)
+        if force:
+            say("   --force 已跳过身份门禁（危险）")
+            return
+        die(EXIT_IDENTITY, "身份门禁拒绝执行。换机器/换 BIOS 后请重新生成 machine.txt。")
+    say("门禁[身份] 通过  BIOS=%s BOARD=%s MODEL=%s"
+        % (live["BIOS"], live["BOARD"], live["MODEL"]))
+
+
+def gate_encryption(force):
+    state, detail = detect_tpm_sealed_volumes()
+    for d in detail:
+        say("   " + d)
+    if state == "sealed":
+        if force:
+            say("门禁[加密] 有 TPM2 密封的卷 —— --force 跳过（危险）")
+            return
+        die(EXIT_ENC_LOCKED,
+            "门禁[加密] 存在把密钥密封进 TPM 的加密卷。先解除 TPM2 绑定"
+            "（systemd-cryptenroll --tpm2-device=none 或 luksRemoveKey 对应 token），"
+            "否则本次改动会让那个卷下次开机进不了系统。")
+    if state == "unknown":
+        if force:
+            say("门禁[加密] 无法判定 —— --force 跳过（危险）")
+            return
+        die(EXIT_ENC_UNKNOWN, "门禁[加密] 无法判定加密状态，需要人工确认后再来。")
+    say("门禁[加密] 通过（没有 TPM 密封的卷）")
+
+
+def gate_layout(patch, live_sizes, force):
+    undo = os.path.join(UNDODIR, patch["slug"] + ".bin")
+    problems = []
+    if patch.get("size"):
+        for name, size in live_sizes.items():
+            if size != patch["size"]:
+                problems.append("   %s 实际 %d 字节，补丁声明 %d 字节"
+                                % (name, size, patch["size"]))
+    if os.path.exists(undo):
+        want = os.path.getsize(undo)
+        for name, size in live_sizes.items():
+            if size != want:
+                problems.append("   %s 实际 %d 字节，首次写入时的基线 %d 字节"
+                                % (name, size, want))
+    if problems:
+        say("门禁[布局] 不匹配：")
+        for p in problems:
+            say(p)
+        if force:
+            say("   --force 已跳过布局门禁（危险）")
+            return
+        die(EXIT_LAYOUT, "门禁[布局] 变量大小/布局变了（刷过 BIOS？清过 CMOS？）—— 重新定位偏移。")
+    say("门禁[布局] 通过（%s）"
+        % ", ".join("%s=%dB" % kv for kv in live_sizes.items()))
+
+
+def gate_values(patch, live, force):
+    """live: {record: bytes}。返回 [(record, off, cur)]，不匹配则退出。"""
+    hits = []
+    bad = []
+    for rec in patch["records"]:
+        data = live.get(rec)
+        if data is None:
+            bad.append("   %s 读不到" % rec)
+            continue
+        for c in patch["changes"]:
+            if c["off"] >= len(data):
+                bad.append("   %s 偏移 0x%X 超出变量长度 %d" % (rec, c["off"], len(data)))
+                continue
+            cur = data[c["off"]]
+            hits.append((rec, c["off"], cur))
+            if cur != c["from"]:
+                if cur == c["to"]:
+                    bad.append("   %s 偏移 0x%X 已经是目标值 0x%02X（这条改动已生效或无需改动）"
+                               % (rec, c["off"], cur))
+                else:
+                    bad.append("   %s 偏移 0x%X 当前 0x%02X，补丁要求 FROM=0x%02X"
+                               % (rec, c["off"], cur, c["from"]))
+    if bad:
+        say("门禁[取值] 不匹配：")
+        for b in bad:
+            say(b)
+        if force:
+            say("   --force 已跳过取值门禁（危险：将按补丁写死值，不再核对旧值）")
+            return hits
+        die(EXIT_LAYOUT, "门禁[取值] 拒绝盲写。偏移不是你以为的那个，或者已经改过了。")
+    say("门禁[取值] 通过（%d 处改动全部对上旧值）" % len(patch["changes"]))
+    return hits
+
+
+# ---------------------------------------------------------------------------
+# 命令
+# ---------------------------------------------------------------------------
+
+def cmd_status(args):
+    ident = live_identity_extended()
+    say("insyde-nvram 状态探针（只读）  v%s" % VERSION)
+    say("=" * 64)
+    say("身份")
+    say("   厂商   %s" % ident["vendor"])
+    say("   机型   %s  (SKU %s)" % (ident["model"], ident["sku"]))
+    say("   主板   %s" % ident["board"])
+    say("   BIOS   %s / %s / %s"
+        % (ident["bios_vendor"], ident["bios_version"], ident["bios_date"]))
+    say("")
+
+    say("门禁基线 machine.txt")
+    if os.path.exists(MACHINE):
+        m = read_machine_file()
+        live = live_identity()
+        ok = all(m.get(k) and m.get(k) == live.get(k) for k in ("BIOS", "BOARD", "MODEL"))
+        say("   状态   已存在，%s" % ("与本机一致" if ok else "与本机不一致 → 写引擎会拒绝"))
+        for k in ("BIOS", "BOARD", "MODEL"):
+            say("   %-5s  %s" % (k, m.get(k)))
+    else:
+        if seed_machine_file():
+            say("   状态   不存在 → 已按本机身份生成")
+        else:
+            say("   状态   不存在，且无法从 DMI 读到完整身份（不会生成）")
+    say("")
+
+    say("固件与变量")
+    if not os.path.isdir(EFIVARS):
+        say("   efivarfs 不存在 —— 不是 UEFI 启动，或没挂载 efivarfs")
+    else:
+        info = _fstype(EFIVARS)
+        say("   efivarfs %s  (%s)" % (EFIVARS, info or "挂载信息不可读"))
+        stores = discover_setup_stores()
+        picked = {g: v for g, v in stores.items()
+                  if any(r["name"] in SETUP_NAMES for r in v)}
+        if not picked:
+            say("   没找到名为 %s 的变量" % "/".join(SETUP_NAMES))
+        for guid, recs in picked.items():
+            say("   变量存储  %s" % guid)
+            for r in recs:
+                say("     %-14s %5d 字节  attrs=0x%08x  %s"
+                    % (r["name"], r["size"], r["attrs"], _attr_words(r["attrs"])))
+    say("")
+
+    say("安全")
+    say("   Secure Boot  %s" % secure_boot_state())
+    say("   TPM          %s" % ("已暴露 (/dev/tpm0)" if tpm_present()
+                               else "未发现 —— fTPM 关闭或固件未暴露"))
+    state, detail = detect_tpm_sealed_volumes()
+    say("   卷加密       %s" % {"none": "无 TPM2 密封卷 → 加密闸门可通过",
+                                "sealed": "存在 TPM2 密封卷 → 写入会被拒绝",
+                                "unknown": "无法判定 → 写入会被拒绝"}[state])
+    for d in detail:
+        say("                " + d)
+    say("")
+
+    say("写入通道")
+    say("   状态   未测试。efivarfs 能读不代表能写 ——")
+    say("           `sudo insyde-nvram probe --record Setup`（只写回原字节，不改任何值）")
+    if os.geteuid() != 0:
+        say("   注意   当前不是 root，正式写入需要 sudo")
+    return EXIT_OK
+
+
+def _fstype(path):
+    try:
+        out = subprocess.run(["findmnt", "-no", "FSTYPE,OPTIONS", "--target", path],
+                             capture_output=True, text=True, timeout=5).stdout.strip()
+        if out:
+            return out.replace("\t", " ")
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        with open("/proc/self/mounts", "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                parts = line.split()
+                if len(parts) >= 4 and parts[1] == path.rstrip("/"):
+                    return "%s %s" % (parts[2], parts[3])
+    except OSError:
+        pass
+    return ""
+
+
+def _attr_words(attrs):
+    w = []
+    if attrs & 1:
+        w.append("NV")
+    if attrs & 2:
+        w.append("BS")
+    if attrs & 4:
+        w.append("RT")
+    if attrs & 8:
+        w.append("HS")
+    if attrs & 0x10:
+        w.append("AUTH")
+    if attrs & 0x20:
+        w.append("AUTH-TIME")
+    return "|".join(w) or "-"
+
+
+def _stamp():
+    return time.strftime("%Y%m%d-%H%M%S")
+
+
+def cmd_list(args):
+    stores = discover_setup_stores()
+    if args.guid:
+        stores = {g: v for g, v in stores.items() if g == args.guid.upper()}
+    elif not args.all:
+        # 默认只看 Setup 类变量；efivarfs 里另外那一百多个是引导项/证书/厂商数据
+        stores = {g: [r for r in v if r["name"] in SETUP_NAMES]
+                  for g, v in stores.items()}
+        stores = {g: v for g, v in stores.items() if v}
+    if not stores:
+        say("没有匹配的变量（--all 看全部）")
+        return EXIT_OK
+    for guid, recs in sorted(stores.items()):
+        say("%s" % guid)
+        for r in recs:
+            say("  %-16s %5d 字节  attrs=0x%08x  %s"
+                % (r["name"], r["size"], r["attrs"], _attr_words(r["attrs"])))
+    return EXIT_OK
+
+
+def _load_snapshot(path):
+    """接受快照目录或单个 .bin。返回 {record: bytes}。"""
+    out = {}
+    if os.path.isdir(path):
+        for fn in sorted(os.listdir(path)):
+            if fn.endswith(".bin"):
+                out[fn[:-4]] = open(os.path.join(path, fn), "rb").read()
+    elif os.path.isfile(path):
+        out[os.path.splitext(os.path.basename(path))[0]] = open(path, "rb").read()
+    else:
+        die(EXIT_PATCH, "找不到快照: %s" % path)
+    return out
+
+
+def cmd_dump(args):
+    if not os.path.isdir(EFIVARS):
+        die(EXIT_ENGINE, "efivarfs 不可用")
+    label = args.label or "dump"
+    outdir = os.path.join(SNAPDIR, "%s_%s" % (_stamp(), re.sub(r"[^\w.-]+", "_", label)))
+    os.makedirs(outdir, exist_ok=True)
+
+    if args.guid:
+        guid = args.guid.upper()
+        names = [r["name"] for r in discover_setup_stores().get(guid, [])]
+        if args.record:
+            names = [n for n in names if n in args.record]
+    else:
+        stores = discover_setup_stores()
+        target = [(g, [r["name"] for r in v]) for g, v in stores.items()
+                  if any(r["name"] in SETUP_NAMES for r in v)]
+        if not target:
+            die(EXIT_ENGINE, "没找到 Setup 类变量，用 --guid/--record 指定")
+        guid, names = target[0][0], target[0][1]
+        if args.record:
+            names = [n for n in names if n in args.record]
+
+    meta = {"guid": guid, "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "identity": live_identity(), "records": {}}
+    lines = ["# insyde-nvram dump  %s  guid=%s" % (meta["time"], guid),
+             "# 偏移为变量数据内偏移（不含 efivarfs 的 4 字节属性头）", ""]
+    for name in names:
+        attrs, data = read_var(guid, name)
+        with open(os.path.join(outdir, name + ".bin"), "wb") as fh:
+            fh.write(data)
+        meta["records"][name] = {"size": len(data), "attrs": attrs,
+                                 "sha256": hashlib.sha256(data).hexdigest()}
+        lines.append("== %s  %d 字节  attrs=0x%08x  sha256=%s"
+                     % (name, len(data), attrs, meta["records"][name]["sha256"]))
+        lines.append(hexdump(data))
+        lines.append("")
+    with open(os.path.join(outdir, "meta.json"), "w", encoding="utf-8") as fh:
+        json.dump(meta, fh, indent=2, ensure_ascii=False)
+    with open(os.path.join(outdir, "dump.txt"), "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+
+    # 兼容层：同时写一份 H2OUVE `-gv` 同格式的转储，让原仓库的
+    # tools/ifr_locate.py verify / ve_parse.py 不改一行就能吃这份快照。
+    allrecs = [r["name"] for r in discover_setup_stores().get(guid, [])]
+    gv = []
+    for idx, name in enumerate(allrecs):
+        attrs, data = read_var(guid, name)
+        gv.append('[%03X] "%s"' % (idx, name))
+        gv.append("GUID: %s" % guid)
+        gv.append("Attributes: 0x%02X" % attrs)
+        gv.append("DataSize: 0x%X" % len(data))
+        for off in range(0, len(data), 16):
+            gv.append("%08X: %s" % (off, " ".join("%02X" % b for b in data[off:off + 16])))
+        gv.append("")
+    with open(os.path.join(outdir, "vars_live.txt"), "w", encoding="utf-8") as fh:
+        fh.write("\n".join(gv) + "\n")
+
+    say("快照已写入 %s" % outdir)
+    for name, m in meta["records"].items():
+        say("   %-14s %5d 字节  sha256=%s…" % (name, m["size"], m["sha256"][:16]))
+    say("   vars_live.txt 为 H2OUVE -gv 同格式，可直接喂给 tools/ifr_locate.py verify")
+    return EXIT_OK
+
+
+def cmd_show(args):
+    snaps = _load_snapshot(args.path)
+    for name, data in snaps.items():
+        say("== %s  %d 字节" % (name, len(data)))
+        a = max(0, args.start)
+        b = len(data) if args.end is None else min(len(data), args.end)
+        say(hexdump(data[a:b], base=a))
+        say("")
+    return EXIT_OK
+
+
+def cmd_diff(args):
+    a = _load_snapshot(args.old)
+    b = _load_snapshot(args.new)
+    common = [n for n in a if n in b]
+    if not common:
+        die(EXIT_PATCH, "两份快照没有同名记录可比")
+    total = 0
+    stub = []
+    for name in common:
+        da, db = a[name], b[name]
+        if len(da) != len(db):
+            say("!! %s 长度不同: %d -> %d（布局变了，偏移不可直接沿用）"
+                % (name, len(da), len(db)))
+        diffs = [(i, da[i], db[i]) for i in range(min(len(da), len(db))) if da[i] != db[i]]
+        if not diffs:
+            say("%s: 字节完全相同" % name)
+            continue
+        say("%s: %d 处差异" % (name, len(diffs)))
+        for off, x, y in diffs:
+            ctx = da[max(0, off - 4):off + 5]
+            say("   0x%03x  %02x -> %02x   上下文 %s" % (off, x, y, ctx.hex(" ")))
+            stub.append((off, x, y))
+        total += len(diffs)
+    say("")
+    say("合计 %d 处差异" % total)
+    if total and args.out:
+        guid_line = ("GUID     = %s" % args.guid.upper()) if args.guid \
+            else "GUID     = <填变量存储的 GUID>"
+        lines = [
+            "# 由 `insyde-nvram diff` 生成 —— 保存前逐行核对，尤其确认 TO 是你想要的值。",
+            "# 差分法只证明「改了之后这些字节变了」，不证明这些字节就是你以为的那个设置项。",
+            "# 验证方式：改回去再快照一次，差异应当只剩这几处。",
+            "NAME     = %s" % (args.name or "diff-candidate"),
+            "VARSTORE = SystemConfig",
+            guid_line,
+            "RECORDS  = %s" % ",".join(common),
+            "",
+        ]
+        for off, x, y in stub:
+            lines.append("CHANGE   = 0x%03X 0x%02X 0x%02X" % (off, x, y))
+        with open(args.out, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+        say("候选补丁已写出: %s" % args.out)
+        say("  注意：如果两份快照之间在 BIOS 里改了不止一项，这里会混在一起 —— 一次只改一项。")
+    return EXIT_OK
+
+
+def cmd_check(args):
+    p = parse_patch(args.patch)
+    if not p["ok"]:
+        die(EXIT_PATCH, "补丁有问题: %s" % p["err"])
+    say("补丁      %s" % p["name"])
+    say("文件      %s" % p["path"])
+    say("变量存储  %s (%s)" % (p["varstore"] or "-", p["guid"]))
+    say("记录      %s" % ", ".join(p["records"]))
+    say("")
+    rc = EXIT_OK
+    for rec in p["records"]:
+        try:
+            attrs, data = read_var(p["guid"], rec)
+        except RuntimeError as e:
+            say("%s: 读不到 —— %s" % (rec, e))
+            rc = EXIT_BLIND
+            continue
+        say("%s  %d 字节  attrs=0x%08x" % (rec, len(data), attrs))
+        for c in p["changes"]:
+            cur = data[c["off"]] if c["off"] < len(data) else None
+            if cur is None:
+                say("   0x%03X  越界" % c["off"])
+                rc = EXIT_LAYOUT
+            elif cur == c["from"]:
+                say("   0x%03X  当前 0x%02X  →  0x%02X   可应用" % (c["off"], cur, c["to"]))
+            elif cur == c["to"]:
+                say("   0x%03X  当前 0x%02X  （已是目标值）" % (c["off"], cur))
+            else:
+                say("   0x%03X  当前 0x%02X  ≠ FROM 0x%02X  ≠ TO 0x%02X  不匹配"
+                    % (c["off"], cur, c["from"], c["to"]))
+                rc = EXIT_LAYOUT
+    say("")
+    say("结论: %s" % {EXIT_OK: "可以应用", EXIT_LAYOUT: "偏移/取值对不上，别写",
+                     EXIT_BLIND: "有记录读不到"}.get(rc, "异常"))
+    return rc
+
+
+def cmd_probe(args):
+    """只把原字节写回，用于判定固件是否允许 OS 侧 SetVariable。"""
+    gate_root()
+    stores = discover_setup_stores()
+    guid = args.guid.upper() if args.guid else None
+    if not guid:
+        cand = [g for g, v in stores.items() if any(r["name"] == args.record for r in v)]
+        if len(cand) != 1:
+            die(EXIT_PATCH, "无法唯一确定 GUID，用 --guid 指定")
+        guid = cand[0]
+
+    attrs, data = read_var(guid, args.record)
+    say("探针目标  %s / %s" % (guid, args.record))
+    say("数据长度  %d 字节  attrs=0x%08x (%s)" % (len(data), attrs, _attr_words(attrs)))
+    say("")
+    say("这个命令做且只做一件事：把当前字节原样写回，然后回读比对。")
+    say("它不会改动任何一个值。失败只说明通道不可用，不会造成副作用。")
+    if not args.yes:
+        ans = input("\n输入 PROBE 继续: ").strip()
+        if ans != "PROBE":
+            say("已取消")
+            return EXIT_PATCH
+    try:
+        cleared = write_var(guid, args.record, data)
+    except RuntimeError as e:
+        say("")
+        say("写入失败: %s" % e)
+        say("")
+        say("VERDICT: WRITE_BLOCKED")
+        return EXIT_CHANNEL_DENIED
+    say("immutable 标志: %s" % ("已清除" if cleared else "无需清除"))
+    _a2, after = read_var(guid, args.record)
+    if after == data:
+        say("回读比对: 完全一致")
+        say("")
+        say("VERDICT: WRITE_OK —— efivarfs 通道可用，可以应用补丁")
+        return EXIT_OK
+    diff = [i for i in range(min(len(data), len(after))) if data[i] != after[i]]
+    say("回读比对: 不一致，%d 处" % len(diff))
+    for i in diff[:20]:
+        say("   0x%03X  %02x -> %02x" % (i, data[i], after[i]))
+    say("")
+    say("VERDICT: WRITE_MUTATED —— 写入被接受但固件改了字节，不要在这个通道上做真实改动")
+    return EXIT_CHANNEL_MUTATED
+
+
+def cmd_apply(args):
+    logpath = os.path.join(LOGDIR, "apply_%s.txt" % _stamp())
+    say("insyde-nvram apply —— 通过 efivarfs 写入补丁字节")
+    say("时间      %s" % time.strftime("%Y-%m-%d %H:%M:%S"))
+    gate_root()
+
+    p = parse_patch(args.patch)
+    if not p["ok"]:
+        flush_log(logpath)
+        die(EXIT_PATCH, "补丁有问题: %s" % p["err"])
+    say("补丁      %s" % p["name"])
+    say("GUID      %s  记录 %s" % (p["guid"], ", ".join(p["records"])))
+    gate_machine(args.force)
+    say("门禁[加密] 检查中…")
+    gate_encryption(args.force)
+
+    live = {}
+    for rec in p["records"]:
+        try:
+            attrs, data = read_var(p["guid"], rec)
+        except RuntimeError as e:
+            flush_log(logpath)
+            die(EXIT_ENGINE, str(e))
+        live[rec] = data
+        say("读取      %-12s %d 字节  attrs=0x%08x" % (rec, len(data), attrs))
+
+    gate_layout(p, {k: len(v) for k, v in live.items()}, args.force)
+    gate_values(p, live, args.force)
+
+    # 目标数据
+    target = {}
+    for rec, data in live.items():
+        buf = bytearray(data)
+        for c in p["changes"]:
+            buf[c["off"]] = c["to"]
+        target[rec] = bytes(buf)
+        for c in p["changes"]:
+            if bytes(buf[c["off"]:c["off"] + 1]) != bytes([c["to"]]):
+                flush_log(logpath)
+                die(EXIT_SANITY, "合理性检查失败: %s 0x%03X 未变成 0x%02X"
+                    % (rec, c["off"], c["to"]))
+
+    say("")
+    say("将要发生的改动：")
+    for rec in p["records"]:
+        for c in p["changes"]:
+            say("   %-12s 0x%03X  0x%02X → 0x%02X" % (rec, c["off"], live[rec][c["off"]], c["to"]))
+    say("")
+
+    if args.dry_run:
+        say("--dry-run：所有门禁通过，未写入任何字节。")
+        flush_log(logpath)
+        return EXIT_OK
+
+    # 首次写入前保存原始字节（undo 只存第一份，绝不覆盖）
+    os.makedirs(UNDODIR, exist_ok=True)
+    for rec in p["records"]:
+        undo = os.path.join(UNDODIR, "%s.%s.bin" % (p["slug"], rec))
+        if not os.path.exists(undo):
+            with open(undo, "wb") as fh:
+                fh.write(live[rec])
+            say("undo      %s （首次生成的原始字节）" % undo)
+        else:
+            say("undo      %s 已存在，保留最早那份" % undo)
+        pre = os.path.join(UNDODIR, "pre_%s_%s.%s.bin" % (p["slug"], _stamp(), rec))
+        with open(pre, "wb") as fh:
+            fh.write(live[rec])
+
+    if not args.yes:
+        ans = input("确认写入？输入补丁名或 YES: ").strip()
+        if ans not in ("YES", "yes", p["name"], p["slug"]):
+            say("已取消")
+            flush_log(logpath)
+            return EXIT_PATCH
+
+    ok_all = True
+    for rec in p["records"]:
+        say("")
+        say("写入      %s …" % rec)
+        try:
+            cleared = write_var(p["guid"], rec, target[rec])
+        except RuntimeError as e:
+            say("   失败: %s" % e)
+            if "固件拒绝" in str(e):
+                flush_log(logpath)
+                die(EXIT_CHANNEL_DENIED,
+                    "通道被拦：固件不接受普通 SetVariable 写这个变量。"
+                    "改用 docs/how-it-works.md 里的备选通道。")
+            flush_log(logpath)
+            die(EXIT_ENGINE, str(e))
+        if cleared:
+            say("   immutable 标志已清除")
+        _a2, after = read_var(p["guid"], rec)
+
+        if after == target[rec]:
+            say("   校验: 与预期逐字节一致")
+            continue
+
+        # 允许固件顺带改写其他字节，但必须：目标字节到位 && 其余字节未被碰
+        bad = [c["off"] for c in p["changes"] if after[c["off"]] != c["to"]]
+        if bad:
+            say("   校验: 目标字节没写进去 (%s)"
+                % ", ".join("0x%03X" % b for b in bad))
+            say("   用 `insyde-nvram restore %s` 回滚，或先完整关机再试" % p["slug"])
+            ok_all = False
+            continue
+        extra = [i for i in range(min(len(after), len(live[rec])))
+                 if after[i] != target[rec][i]]
+        say("   校验: 目标字节到位，但固件另外改写了 %d 字节 (%s)"
+            % (len(extra), ", ".join("0x%03X" % i for i in extra[:10])))
+        say("   记录！这些字节不在补丁范围内，回滚文件仍然有效。")
+
+    say("")
+    if ok_all:
+        say("完成。设置项由固件在开机时读取 —— 请**完全关机**（poweroff），")
+        say("再开机才会生效。reboot 不算。")
+        say("回滚: sudo insyde-nvram restore %s" % p["patch"])
+    flush_log(logpath)
+    return EXIT_OK if ok_all else EXIT_VERIFY
+
+
+def cmd_restore(args):
+    logpath = os.path.join(LOGDIR, "restore_%s.txt" % _stamp())
+    gate_root()
+    p = parse_patch(args.patch)
+    if not p["ok"]:
+        die(EXIT_PATCH, "补丁有问题: %s" % p["err"])
+    say("回滚      %s" % p["name"])
+
+    state, detail = detect_tpm_sealed_volumes()
+    say("加密状态  %s（回滚只报告，不拦 —— 卷已经躺进恢复模式时，把 TPM 放回去才是修复）"
+        % state)
+    for d in detail:
+        say("          " + d)
+
+    restored = 0
+    for rec in p["records"]:
+        undo = os.path.join(UNDODIR, "%s.%s.bin" % (p["slug"], rec))
+        if not os.path.exists(undo):
+            say("   缺少 %s —— 没有这个 patch 的原始副本" % undo)
+            continue
+        orig = open(undo, "rb").read()
+        try:
+            _a, cur = read_var(p["guid"], rec)
+        except RuntimeError as e:
+            die(EXIT_ENGINE, str(e))
+        if cur == orig:
+            say("   %s 已经是原始字节，跳过" % rec)
+            restored += 1
+            continue
+        if not args.yes:
+            ans = input("写回 %s 的原始 %d 字节？输入 YES: " % (rec, len(orig))).strip()
+            if ans != "YES":
+                say("已取消")
+                flush_log(logpath)
+                return EXIT_PATCH
+        try:
+            write_var(p["guid"], rec, orig)
+        except RuntimeError as e:
+            flush_log(logpath)
+            die(EXIT_CHANNEL_DENIED if "固件拒绝" in str(e) else EXIT_ENGINE, str(e))
+        _a, after = read_var(p["guid"], rec)
+        if after == orig:
+            say("   %s 已恢复并校验一致" % rec)
+            restored += 1
+        else:
+            say("   %s 恢复后仍不一致" % rec)
+    say("")
+    say("回滚完成 %d 个记录。完全关机后生效。" % restored)
+    flush_log(logpath)
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def build_parser():
+    ap = argparse.ArgumentParser(
+        prog="insyde-nvram",
+        description="Insyde H2O 笔记本 NVRAM 补丁工具（Linux / efivarfs 版）",
+        epilog="先读 docs/how-it-works.md 和 DISCLAIMER.md。改动固件 NVRAM 可能变砖。")
+    ap.add_argument("--version", action="version", version="insyde-nvram " + VERSION)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("status", help="只读状态探针（首次运行会生成 machine.txt）")
+    s.add_argument("--json", action="store_true", help="机器可读输出（未实现时忽略）")
+    s.set_defaults(func=cmd_status)
+
+    s = sub.add_parser("list", help="列出 efivarfs 里的 Setup 类变量")
+    s.add_argument("--guid")
+    s.add_argument("--all", action="store_true", help="列出全部变量（含引导项/证书）")
+    s.set_defaults(func=cmd_list)
+
+    s = sub.add_parser("dump", help="打一份快照到 snapshots/")
+    s.add_argument("--guid")
+    s.add_argument("--record", action="append", help="只导出指定记录（可多次）")
+    s.add_argument("--label", default="", help="快照标签，例如 before / after-biossave")
+    s.set_defaults(func=cmd_dump)
+
+    s = sub.add_parser("show", help="十六进制查看快照")
+    s.add_argument("path")
+    s.add_argument("--start", type=lambda x: int(x, 0), default=0)
+    s.add_argument("--end", type=lambda x: int(x, 0), default=None)
+    s.set_defaults(func=cmd_show)
+
+    s = sub.add_parser("diff", help="比较两份快照，生成候选补丁（差分定位法）")
+    s.add_argument("old")
+    s.add_argument("new")
+    s.add_argument("--out", help="把差异写成候选 .patch")
+    s.add_argument("--guid", help="候选补丁里要填的 GUID")
+    s.add_argument("--name", help="候选补丁的 NAME")
+    s.set_defaults(func=cmd_diff)
+
+    s = sub.add_parser("check", help="只读：显示补丁会动哪个字节、当前值是多少")
+    s.add_argument("patch")
+    s.set_defaults(func=cmd_check)
+
+    s = sub.add_parser("apply", help="应用补丁（会修改 NVRAM）")
+    s.add_argument("patch")
+    s.add_argument("--dry-run", action="store_true", help="跑完所有门禁但不写入")
+    s.add_argument("--yes", action="store_true", help="跳过交互确认")
+    s.add_argument("--force", action="store_true", help="一次性跳过所有门禁（危险）")
+    s.set_defaults(func=cmd_apply)
+
+    s = sub.add_parser("restore", help="按 undo 副本逐字节回滚")
+    s.add_argument("patch")
+    s.add_argument("--yes", action="store_true")
+    s.set_defaults(func=cmd_restore)
+
+    s = sub.add_parser("probe", help="写通道探针：原样写回，不改任何值")
+    s.add_argument("--record", default="Setup")
+    s.add_argument("--guid")
+    s.add_argument("--yes", action="store_true")
+    s.set_defaults(func=cmd_probe)
+
+    return ap
+
+
+def main(argv):
+    ap = build_parser()
+    args = ap.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        print("\n中断")
+        sys.exit(130)

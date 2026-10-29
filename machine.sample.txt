@@ -1,0 +1,17 @@
+# machine.sample.txt -- 本机身份基线模板。复制成 machine.txt 再填值。
+#
+# 通常不需要这个模板：`insyde-nvram status` 在 machine.txt 不存在时会
+# 自动按本机 DMI 生成。只有要在别的机器上提前准备目录、或者想手写不同
+# 的值时才用它。
+#
+# 字段对应关系（Linux /sys/class/dmi/id）：
+#   BIOS  = bios_version
+#   BOARD = board_name
+#   MODEL = product_name
+#
+# 这个文件只做身份闸门。要改哪个字节，写在 patches/*.patch 里，
+# 绝不写在这里 —— 藏在本地文件里的偏移无法 diff、无法审阅。
+
+BIOS=<bios_version>
+BOARD=<board_name>
+MODEL=<product_name>
