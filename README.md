@@ -47,6 +47,19 @@ TPM                   fTPM 关闭（固件层）：无 /dev/tpm0、ACPI 无 TPM2
 
 两条记录**内容不完全相同**：`0x061 / 0x066 / 0x0A8 / 0x226` 四处不一致（这是「当前设置」与「用户自定义默认值」的差别）。所以补丁默认只写 `Setup`；如果你确实要连 `Custom` 一起改，先看 [docs/making-a-patch.md](docs/making-a-patch.md) 第 6 节。
 
+### fTPM 的偏移已由固件自证
+
+拿官方升级包 `RMGCZ6T0P0909.zip` 拆出 `Cert_A7S_NAC.fd`，`tools/ifr_locate.py` 在里面定位到：
+
+```
+Trust Platform Module   [OneOf]   formset='Advanced' / form='Peripheral Configuration'
+varstore SystemConfig   guid A04A27F4-DF00-4D42-B552-39511302113D
+VarOffset = 0x100   0=Disable  1=Enable discrete TPM  2=Enable firmware TPM
+实机 0x100 = 0x00 -> Disable     ← 与「fTPM 关闭」的判定一致
+```
+
+这不是猜：IFR 声明该 VarStore 为 `0x2BC` = 700 字节，与实机变量长度一致；`verify` 逐项比对时几十个设置的实机字节全部落在声明取值内。全套命令见 [docs/from-bios-package.md](docs/from-bios-package.md)，成品补丁见 `patches/ftpm-enable-RMGCZ6T0P0909.patch`。
+
 ---
 
 ## 3. 安装
@@ -112,17 +125,28 @@ CHANGE   = 0x2A0 0x01 0x00
 
 ### 路线 A：从固件 IFR 定位并证明（推荐，和原仓库一致）
 
-`tools/ifr_locate.py` 未改一行拿过来用，纯 Python、跨平台：
+`tools/ifr_locate.py` 拿过来用，纯 Python、跨平台。实测跑通于 Xiaomi 官方包
+`RMGCZ6T0P0909.zip`（详见 [docs/from-bios-package.md](docs/from-bios-package.md)）：
 
 ```bash
-# 1. 解出固件里的 Setup 模块（.zip/.exe/.fd 都能吃）
-python3 tools/ifr_locate.py extract BIOS升级包.exe -o out/
+# 1. 拆包：zip → exe(7z SFX) → Cert_A7S_NAC.fd → SetupUtility FFS
+python3 tools/ifr_locate.py extract ~/Downloads/RMGCZ6T0P0909.zip --out fw/extract
 
 # 2. 按关键词定位，直接生成候选补丁存根
-python3 tools/ifr_locate.py find out/Setup_*.ffs "Trust Platform Module" --out patches/tpm.patch
+python3 tools/ifr_locate.py find fw/extract/Setup_*.ffs "trust platform" \
+        --out patches/tpm.patch
 
 # 3. 用真实转储证明这个偏移确实解释得了实机字节
-python3 tools/ifr_locate.py verify out/Setup_*.ffs snapshots/<某次>/vars_live.txt
+python3 tools/ifr_locate.py verify fw/extract/Setup_*.ffs \
+        snapshots/<某次>/vars_live.txt
+```
+
+`extract` 只挖出 SetupUtility 那一支 FFS（本机 147 条设置）；AMD CBS / PBS、
+Secure Boot 这些 formset 在 LZMA 压缩卷里，要先解开整片镜像才能定位（1028 条）：
+
+```bash
+python3 tools/fw_unpack.py fw/RMGCZ6T0P0909/Cert_A7S_NAC.fd -o fw/
+python3 tools/ifr_locate.py find fw/p1.fd tpm
 ```
 
 第 3 步是用**你自己**的快照做的：`dump` 除了写 `.bin`，还会写一份 `vars_live.txt`，格式与 `H2OUVE -gv` 完全一致 —— 原仓库的 `ve_parse.py` 和 `ifr_locate.py verify` 不用改就能解析（已实测）。
@@ -238,10 +262,13 @@ snapshots/            每次 dump 的快照（.bin + dump.txt + vars_live.txt + 
 undo/                 原始字节副本（<slug>.<record>.bin 与 pre_* 审计副本）
 export/               export 的离线产物（target.*.bin + changes.txt）
 logs/                 apply / restore 的完整日志；logs/channel.json 记着上次探针结果
-tools/ifr_locate.py   从固件 IFR 定位偏移（原仓库脚本，未改）
+tools/ifr_locate.py   从固件 IFR 定位偏移（原仓库脚本；本版修了两处 Linux 问题）
+tools/fw_unpack.py    解开镜像里 GUID 定义的 LZMA 压缩卷（拿全量 formset 用）
 tools/ve_parse.py     解析 H2OUVE 格式转储（原仓库脚本，未改）
 docs/how-it-works.md  通道原理、为什么不刷 BIOS、为什么 poweroff
 docs/making-a-patch.md 补丁格式、定位纪律、一次一个 patch 的理由
+docs/from-bios-package.md 从官方 BIOS 升级包定位偏移的实测记录
+fw/                   固件镜像与拆包产物（git 忽略，可由升级包重新生成）
 ```
 
 ---

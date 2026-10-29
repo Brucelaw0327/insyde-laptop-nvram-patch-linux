@@ -1615,11 +1615,15 @@ def _extract_7z(exe_path, workdir):
                 continue
 
     # 3) 7-Zip console: repo-local portable copy first (bin\7za.exe or
-    #    bin\7z.exe), then PATH, then Program Files
+    #    bin\7z.exe), then PATH (Windows and Linux names alike), then
+    #    Program Files
     bindir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'bin')
     candidates = [os.path.join(bindir, '7za.exe'),
                   os.path.join(bindir, '7z.exe'),
+                  shutil.which('7zz') or '',
+                  shutil.which('7za') or '',
                   shutil.which('7z') or '',
+                  shutil.which('7zr') or '',
                   r'C:\Program Files\7-Zip\7z.exe']
     for sevenzip in candidates:
         if sevenzip and os.path.exists(sevenzip):
@@ -1649,7 +1653,9 @@ def cmd_extract(args):
     outdir = args.outdir or os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'bios_cache')
     os.makedirs(outdir, exist_ok=True)
-    workdir = tempfile.mkdtemp(prefix='ifr_x_')
+    # 中间产物是几十 MB 的固件镜像：必须落在磁盘上。
+    # tempfile 默认用 /tmp，而 Arch 系的 /tmp 是 10 MB tmpfs，解到一半就 ENOSPC。
+    workdir = tempfile.mkdtemp(prefix='ifr_x_', dir=outdir)
 
     try:
         blob = src

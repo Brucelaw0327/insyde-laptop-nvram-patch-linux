@@ -32,7 +32,33 @@ cd ~/WorkBuddy/2026-10-30-00-44-44/insyde-nvram-linux
 
 ---
 
-## 2. 场景 A：定位一项 BIOS 设置（主力用法）
+## 2. 场景 A：定位一项 BIOS 设置
+
+### A1. 有官方 BIOS 升级包（首选，两条命令）
+
+不用进 BIOS、不用改任何东西，偏移是固件自己说的：
+
+```bash
+python3 tools/ifr_locate.py extract ~/Downloads/RMGCZ6T0P0909.zip --out fw/extract
+python3 tools/ifr_locate.py find fw/extract/Setup_*.ffs tpm
+```
+
+输出直接给你 `VarOffset`、取值表和一份候选补丁存根。再用实机转储对账：
+
+```bash
+python3 tools/ifr_locate.py verify fw/extract/Setup_*.ffs snapshots/<快照>/vars_live.txt
+```
+
+本机实测结果（BIOS `RMGCZ6T0P0909`）：
+
+```
+Trust Platform Module   SystemConfig   VarOffset=0x100
+    0=Disable   1=Enable discrete TPM   2=Enable firmware TPM
+```
+
+细节和两个 Linux 坑见 [docs/from-bios-package.md](docs/from-bios-package.md)。
+
+### A2. 没有升级包：差分定位
 
 前提：这一项在 BIOS 界面里**看得见、能改**。目的是拿到它的偏移，好写进补丁。
 
