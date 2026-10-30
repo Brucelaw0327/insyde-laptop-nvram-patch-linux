@@ -2,7 +2,7 @@
 
 **在 Insyde H2O 笔记本上安全地定位并修改 BIOS Setup 里被隐藏的设置项** —— 不刷 BIOS、不清 CMOS、不进 BIOS 菜单，直接编辑支撑该设置的 NVRAM 变量。
 
-这是 [insyde-laptop-nvram-patch](https://github.com/Brucelaw0327/insyde-laptop-nvram-patch)（Windows / H2OUVE 版）的 Linux 对照实现，为 **TIMI A7S / TM2037（Redmi G 2021 锐龙版，R7 5800H，Insyde H2O）** 实测通过。
+这是 [insyde-laptop-nvram-patch-windows](https://github.com/Brucelaw0327/insyde-laptop-nvram-patch-windows)（Windows / H2OUVE 版）的 Linux 对照实现，为 **TIMI A7S / TM2037（Redmi G 2021 锐龙版，R7 5800H，Insyde H2O）** 实测通过。工具本身是**通用的 Insyde NVRAM 读写器**——fTPM 只是它的一个验证案例，任何 Setup 变量位都可以用同一套流程修改。
 
 > ⚠️ **这会改固件 NVRAM。它可能让机器变砖。** 读 [DISCLAIMER.md](DISCLAIMER.md) 和 [docs/how-it-works.md](docs/how-it-works.md) 再动手。
 >
@@ -14,7 +14,7 @@
 
 | | Windows 版 | 本版 | 说明 |
 |---|---|---|---|
-| 写入通道 | H2OUVE + `segwindrv` 内核驱动（SMI 服务） | **efivarfs**（内核 SetVariable） | 不需要任何厂商工具或驱动 |
+| 写入通道 | H2OUVE + `segwindrv` 内核驱动（SMI 服务） | **efivarfs** 为主 + **IHISI SMI** 为备 | 两条都实现了：前者靠内核 `SetVariable`，后者自己 `out` 进 SMI 端口，都不需要厂商工具或驱动 |
 | 转储 | `H2OUVE -gv` | 直接读 `/sys/firmware/efi/efivars` | 免安装，免管理员 |
 | 补丁文件格式 | `NAME/VARSTORE/GUID/RECORDS/OFFSET/FROM/TO` 或 `CHANGE` | **完全相同** | 已有 `.patch` 直接可用 |
 | 身份门禁 | 注册表 BIOS/BOARD/MODEL | `/sys/class/dmi/id/*` | 同样的三道值 |
@@ -74,19 +74,22 @@ sudo ./install.sh              # 可选：装到 /usr/local/bin，符号链接�
 
 ---
 
-## 4. 五个操作
+## 4. 操作清单
 
 ```bash
 insyde-nvram status                     # 1 只读探针：身份/变量/TPM/加密/通道
 insyde-nvram dump --label before        # 2 打快照（差分定位的第一步）
 insyde-nvram check  patches/xxx.patch   # 3 只读：它会动哪个字节，现在是几
 sudo insyde-nvram apply patches/xxx.patch --dry-run   # 4 跑完所有门禁但不写
-sudo insyde-nvram apply patches/xxx.patch             # 4 真的写
+sudo insyde-nvram apply patches/xxx.patch             # 4 真的写（efivarfs）
+sudo insyde-nvram apply patches/xxx.patch --via ihisi # 4 真的写（SMI，绕写保护）
 sudo insyde-nvram restore patches/xxx.patch           # 5 逐字节回滚
 sudo insyde-nvram probe --record Setup                # 6 通道探针（原样写回）
 sudo insyde-nvram probe --scan                        # 6 通道扫描（分清哪种封锁）
-insyde-nvram export patches/xxx.patch --out export/x  # 7 离线导出（换通道时用）
-insyde-nvram tpm                        # 8 fTPM 状态判定 / 开启实验（第 12 节）
+sudo insyde-nvram ihisi --discover                    # 7 IHISI：只读探测端口与主功能号
+sudo insyde-nvram ihisi --ping                        # 7 IHISI：发子功能 0x10 确认通道
+insyde-nvram export patches/xxx.patch --out export/x  # 8 离线导出（换通道时用）
+insyde-nvram tpm                        # 9 fTPM 状态判定 / 开启实验（第 12 节）
 ```
 
 `./run.sh` 是菜单前端，对应原仓库的 `run.cmd`。
@@ -224,7 +227,23 @@ sudo insyde-nvram probe --scan
 
 换通道，按代价排序：
 
-1. **Windows + H2OUVE**（最省事，这台机器有 Windows 分区）。补丁文件格式完全通用，把 `patches/*.patch` 拷过去用原仓库的 `apply_patch.ps1` 写。
+0. **本项目的 IHISI 通道（Linux 原生，不需要 H2OUVE / Windows / 内核模块）**。
+   直接把报文 `out` 进 SMI 端口，交给 SMM 执行 —— 这正是 H2OUVE 在 Windows 上
+   用的那条路，协议已完整逆向。需要 root 和一个 C 编译器（首次使用时自动编译
+   一个几十行的调用器）。
+
+   ```bash
+   sudo ./insyde-nvram ihisi --discover    # 只读：SMI 端口 + 主功能号
+   sudo ./insyde-nvram ihisi --ping        # 发子功能 0x10，确认通道存在
+   sudo ./insyde-nvram apply xxx.patch --via ihisi --dry-run   # 拼报文，不发送
+   sudo ./insyde-nvram apply xxx.patch --via ihisi             # 真写
+   ```
+
+   原理、报文格式、寄存器约定、限制与未验证项见 **`docs/ihisi-channel.md`**。
+   注意：这一条**尚未在实机验证过真实写入**，请严格按 `--discover` → `--ping` →
+   `--dry-run` 的顺序逐步确认。
+
+1. **Windows + H2OUVE**（这台机器有 Windows 分区）。补丁文件格式完全通用，把 `patches/*.patch` 拷过去用原仓库的 `apply_patch.ps1` 写。
 2. **UEFI Shell + RU.EFI**。有些 Insyde 只在 runtime（虚拟模式）调用时拒绝，boot services 里执行的应用能写进去 —— 值得一试。手动按字节改，位置用下面 `export` 出的改动表。
 3. **GRUB 的 `setup_var`**。需要在 U 盘里装一份带该模块的 GRUB；本机引导是 Limine，没有 GRUB，所以要先准备 U 盘。
 4. **离线导出**（任何通道都能用，不含写入动作）：
@@ -265,7 +284,10 @@ logs/                 apply / restore 的完整日志；logs/channel.json 记着
 tools/ifr_locate.py   从固件 IFR 定位偏移（原仓库脚本；本版修了两处 Linux 问题）
 tools/fw_unpack.py    解开镜像里 GUID 定义的 LZMA 压缩卷（拿全量 formset 用）
 tools/ve_parse.py     解析 H2OUVE 格式转储（原仓库脚本，未改）
+ihisi.py              IHISI SMI 通道：探测、物理页、报文构造、调用（第 9 节）
+ihisi/ihisi_smi.c     SMI 调用器源码（几十行内联汇编，首次使用时自动编译）
 docs/how-it-works.md  通道原理、为什么不刷 BIOS、为什么 poweroff
+docs/ihisi-channel.md IHISI 通道：报文格式、寄存器约定、限制与未验证项
 docs/making-a-patch.md 补丁格式、定位纪律、一次一个 patch 的理由
 docs/from-bios-package.md 从官方 BIOS 升级包定位偏移的实测记录
 fw/                   固件镜像与拆包产物（git 忽略，可由升级包重新生成）
@@ -298,10 +320,47 @@ sudo insyde-nvram tpm --after snapshots/<基线> --out patches/ftpm-on.patch
 
 1. **BIOS 里直接开**（如果 setup 里看得见 TPM / Security Device / AMD fTPM switch）。有就直接开，用不着这个工具。
 2. **差分实验**（推荐，也是唯一能同时拿到偏移的办法）：`tpm --baseline` → 重启进 BIOS **只改 fTPM 这一项** → 保存 → 回系统跑 `tpm --after`。它会告诉你两件事：字节差在哪、fTPM 到底起来没有。事后想反悔或者想批量部署，这几处字节就是一条补丁。
-3. **改 NVRAM 写进去**：得有偏移（来自 2 或 IFR）＋一条能写的通道。本机写通道被固件拦着，这条路目前不通，见第 9 节。
+3. **改 NVRAM 写进去**：得有偏移（来自 2 或 IFR）＋一条能写的通道。efivarfs 通道被固件写保护时，走第 13 节的 **IHISI SMM 通道**——本机实测已用它在系统内直接打开了 fTPM（`tools/ftpm_write.py`）。
 
 ### 两个坑
 
 - **AMD 上 fTPM 首次启用要完全断电**（`poweroff` 或长按电源 10 秒），`reboot` 常常不够：PSP 得在冷启动时才会去初始化 fTPM。所以 `tpm --after` 报「字节变了但 TPM 还没起来」时先别下结论，先冷启动一次再看。
 - **BitLocker / LUKS-TPM2 绑着的时候别动 fTPM**：清 fTPM 或换状态会触发恢复密钥。本机目前没有 LUKS，也没有 TPM2 token，所以是安全的。想给 LUKS 绑 TPM2：`systemd-cryptenroll --tpm2-device=auto --tpm2-pcrs=0+7 <设备>`。
+
+---
+
+## 13. IHISI SMM 写通道（efivarfs 被写保护时）
+
+efivarfs 返回 `EROFS`（`EFI_WRITE_PROTECTED`）时，变量并不是"不可写"——Insyde 固件只是把 runtime 的 SetVariable 拦了，但 SMM 里的 IHISI `VatsWrite`（子功能 0x01）服务还在，且走的是另一条更老的校验路径。本仓库把它复刻成了纯 Linux 实现（协议分析见 [docs/ihisi-channel.md](docs/ihisi-channel.md)，全部来自对固件镜像的静态逆向）：
+
+```
+用户态                        内核态(ihisi_diag.ko)                SMM
+──────                        ─────────────────────                ───
+1. SMI(0x83 GetCmdBuf)  ──────────────────────────────────►  返回 RCX=SMM 池基址 / RDX=池大小
+2. 构造 IHISI 报文（GUID/名字/$H2O/$Var/$Tbl/校验和/数据）
+3. ioctl PHYS_WRITE      ── memremap 把报文写进池 ──►
+4. SMI(0x01 VatsWrite, ESI=报文, EDI=$H2O 区) ─────────────►  校验指针落池+魔数+校验和
+                                                             → SMM SetVariable
+5. 回读 EAX：AL=0 成功 / 0x8012 校验和 / 0x8014 SetVariable 拒绝 / 0x802B 落池失败
+```
+
+关键约束（逆向实测）：
+
+- 报文**必须落在 SMM 池内**（`[池基址, +0x30000)`），只把指针指过去而内容不在池里 = 0x802B
+- 池基址每次开机都变，必须现调 `0x83` 现拿
+- 校验和 = 数据区全体字节和的 16 位补码，置于报文 `0x3E+名字字节数`
+- SMI 主功能号 `0xEF`、握手签名 `EBX="O2H$"`、端口 = FACP 的 `SMI_CMD`（AMD FCH 为 0xB0）
+
+用法（以 fTPM 为例，通用于任何 Setup 变量位）：
+
+```bash
+make -C kernel                                       # 编译 ihisi_diag.ko
+sudo insmod kernel/ihisi_diag.ko                     # /dev/ihisi_buf（重启后需重载）
+sudo python3 tools/ftpm_write.py                     # dry-run：读 Setup + VatsRead 验证链路
+sudo python3 tools/ftpm_write.py --apply             # 写 0x100=0x02 打开 fTPM
+sudo python3 tools/ftpm_write.py --off --apply       # 写 0x100=0x00 关闭 fTPM
+sudo python3 tools/ftpm_write.py --verify            # SMM 回读确认
+```
+
+> ⚠️ 这条通道绕过了固件对 runtime 写的保护，威力更大、风险也更大。脚本写之前自动备份（`setup_backup_*.bin`），并遵守 [DISCLAIMER.md](DISCLAIMER.md)。
 

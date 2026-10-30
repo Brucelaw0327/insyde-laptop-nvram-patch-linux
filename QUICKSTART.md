@@ -94,7 +94,62 @@ Trust Platform Module   SystemConfig   VarOffset=0x100
 
 ## 3. 场景 B：真要把它写进去
 
-本机唯一通路是**换通道**，工具负责把「写什么」算准：
+先试默认通道（efivarfs / SetVariable）：
+
+```bash
+sudo ./insyde-nvram apply patches/xxx.patch --dry-run   # 跑完所有门禁，不写
+sudo ./insyde-nvram apply patches/xxx.patch             # 真写
+```
+
+本机会报 `Read-only file system` —— 那是固件返回 `EFI_WRITE_PROTECTED`（跟文件
+系统无关）。**换 IHISI 通道**，这是 Linux 原生的绕行方案，不需要 H2OUVE、
+不需要 Windows、不需要内核模块。
+
+### B1. 一条命令跑完（推荐）
+
+```bash
+sudo bash scripts/enable-ftpm.sh               # 交互确认后写
+sudo bash scripts/enable-ftpm.sh --check-only  # 只验通道，不写
+```
+
+它把五道门按顺序串起来，任何一步不符合预期就停：快照 → 探测 → 握手 → **原样
+写回** → 空跑 → 写入 → 读回。其中「原样写回」是最关键的一步：用真实的 `0x01`
+报文走完整条 SMI 链路，但写进去的字节和现在完全一样，**成功不改变任何东西，
+失败也没有副作用**。它是「报文格式对不对」的唯一可靠判据。
+
+### B2. 手动逐步跑
+
+```bash
+sudo ./insyde-nvram ihisi --discover --func 0x64        # 1 只读：端口 + 主功能号
+sudo ./insyde-nvram ihisi --ping     --func 0x64        # 2 子功能 0x10，无副作用
+sudo ./insyde-nvram probe --record Setup --via ihisi --func 0x64 --yes   # 3 原样写回
+sudo ./insyde-nvram apply patches/xxx.patch --via ihisi --func 0x64 --dry-run
+sudo ./insyde-nvram apply patches/xxx.patch --via ihisi --func 0x64     # 4 真写
+```
+
+`--func 0x64` 是因为**本机 F 段扫不到 `$IHISI` 标签**。扫描失败的原因已经查清：
+`/dev/mem` 在 `CONFIG_STRICT_DEVMEM=y` 下对非 RAM 页给的是内核填充（熵 8.000、
+256 个字节值全现、32 位全 0/全 1 各 0 个），**不是固件内容**，所以「扫不到」
+不能说明标签不存在。`0x64` 这个值是从解压后的固件里直接读到的
+（`p1.fd @ 0x3DBA34`，`"HFDM" "O2H$" "$IHISI" 0x64`），不是猜的。
+驱动自己的回退值是 `0xEF`，握手失败时可以用 `--func 0xEF` 再试。
+
+> **当前卡点**：实机 `--ping` 发出去后寄存器原样不动（`eax` 还是输入值、
+> `ebx` 还是 `"O2H$"`），换 `0xEF` 也一样 —— 说明 `out 0xB0` 根本没进 SMM。
+> 端口和功能号都已确认，最可能的原因是固件在开启 NVRAM 写保护时
+> 连带关掉了 IHISI 的 runtime 入口。诊断下一步：
+>
+> ```bash
+> sudo python3 tools/fseg_scan.py --peek   # 不发 SMI：查 00b0 端口归属 + FADT 字段
+> ```
+
+报文格式、寄存器约定、已知限制见 **`docs/ihisi-channel.md`**。
+
+> 注意：IHISI 通道的协议是从 H2OUVE 和固件里双向逆向确认的，报文构造有 20 项
+> 自检，**「原样写回」能过就说明报文被 SMM 接受了**，但这仍不等于真实改动
+> 一定成功 —— 第一次请按上面的顺序走，别跳过第 3 步。
+
+再不行就离线导出，走手工通道。工具负责把「写什么」算准：
 
 ```bash
 ./insyde-nvram export patches/xxx.patch --out export/xxx
@@ -109,7 +164,7 @@ export/xxx/changes.txt        # 偏移表 + 上下文，人看
 
 然后二选一：
 
-- **Windows + H2OUVE（最省事）**：`patches/xxx.patch` 格式和你原仓库完全一致，
+- **Windows + H2OUVE**：`patches/xxx.patch` 格式和你原仓库完全一致，
   拷到 Windows 侧直接用 `apply_patch.ps1` 写，不用改一个字符。
 - **UEFI Shell + RU.EFI**：按 `changes.txt` 里的 `0x0A8 01 -> 00` 逐条改。
   有些 Insyde 只在 boot services 里放行，值得一试。

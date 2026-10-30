@@ -5,7 +5,9 @@
 这是 Windows 版 insyde-laptop-nvram-patch 的 Linux 对照实现：
   * 补丁文件格式完全相同（NAME / VARSTORE / GUID / RECORDS / OFFSET+FROM+TO 或 CHANGE）
   * 身份门禁、逐字节回滚、写入后读回校验的逻辑保持一致
-  * 写入通道由 H2OUVE 的 SMI 服务改成内核 efivarfs（SetVariable）
+  * 写入通道：默认走内核 efivarfs（SetVariable）；固件用 EFI_WRITE_PROTECTED
+    驳回时，可以改用 --via ihisi 直接向 SMI 端口发报文（等价于 H2OUVE 的做法，
+    不需要 H2OUVE、不需要 Windows、不需要内核模块，只需要 root 和一个 C 编译器）。
 
 差别（因为平台不同，不是简化）：
   * 没有 H2OUVE、没有 segwindrv 内核驱动、没有"最小记录文件"。
@@ -379,8 +381,72 @@ def clear_immutable(path):
     return True
 
 
-def write_var(guid, name, data):
+def _load_ihisi():
+    """延迟加载 ihisi 模块 —— 用 efivarfs 通道时完全不需要它。"""
+    if HERE not in sys.path:
+        sys.path.insert(0, HERE)
+    import ihisi
+    return ihisi
+
+
+def write_var_ihisi(guid, name, data, info=None):
+    """通过 IHISI SMI 写变量，绕过固件对 SetVariable 的写保护。
+
+    与 efivarfs 路径的差别：
+      * 不碰 immutable inode 标志（那是文件系统层面的东西）
+      * 不看 AUTHENTICATED_WRITE_ACCESS 位（那是 SetVariable 的约束，
+        SMM 走的是另一条路，不受它管）
+      * 报文由我们按 H2OWriteVariable 的布局自己拼，SMM 看到的内容
+        与 H2OUVE 发过去的逐字节一致
+    """
+    ih = _load_ihisi()
+    if info is None:
+        try:
+            info = ih.discover(verbose=False)
+        except ih.IhisiError as e:
+            raise ChannelDenied("IHISI 探测失败: %s" % e)
+    try:
+        attrs, _ = read_var(guid, name)
+    except RuntimeError:
+        attrs = 0x07
+    try:
+        res = ih.write_variable(guid, name, data, attrs, info=info)
+    except ih.IhisiError as e:
+        raise ChannelDenied("IHISI 写入失败: %s" % e)
+    st = res.get("status", 0xFF)
+    if st != 0:
+        # 完整证据：寄存器回写值 + 报文缓冲的 SMM 侧改动
+        reg = {k: res[k] for k in ("eax", "ebx", "ecx", "edx", "esi", "edi")
+               if k in res}
+        regs = " ".join("%s=0x%08X" % (k.upper(), v) for k, v in reg.items())
+        echo = res.get("echo", b"")
+        pkt = res.get("packet", b"")
+        diffs = [(i, pkt[i], echo[i])
+                 for i in range(min(len(pkt), len(echo)))
+                 if pkt[i] != echo[i]]
+        lines = [
+            "SMM 返回状态 0x%02X（非 0 即拒绝）。子功能 0x01 报文长 %d 字节，"
+            "ESI=0x%08X EDI=0x%08X。" % (st, res.get("packet_len", 0),
+                                         res.get("esi", 0), res.get("edi", 0)),
+            "  回写寄存器: %s" % regs,
+            "  （发送时 EAX = (子功能0x01 << 8) | 主功能号 = 0x00000164，对照上行）",
+        ]
+        if diffs:
+            lines.append("  ★ SMM 改写了报文缓冲 %d 处（前 16 个）：" % len(diffs))
+            for i, a, b in diffs[:16]:
+                lines.append("    +%#05x: %02x -> %02x" % (i, a, b))
+        else:
+            lines.append("  报文缓冲回读与发送一致（SMM 没写输出块）")
+        lines.append("  常见原因：端口/主功能号猜错、报文校验和被拒、"
+                     "或该变量需要认证写入。")
+        raise ChannelDenied("\n".join(lines))
+    return False
+
+
+def write_var(guid, name, data, via="efivarfs", info=None):
     """整块写入变量数据。成功返回是否清过 immutable，失败抛 ChannelDenied/RuntimeError。"""
+    if via == "ihisi":
+        return write_var_ihisi(guid, name, data, info=info)
     path = efivar_path(guid, name)
     if not os.path.exists(path):
         raise RuntimeError("变量不存在: %s" % path)
@@ -1268,6 +1334,24 @@ def cmd_probe(args):
         guid = cand[0]
 
     attrs, data = read_var(guid, args.record)
+    via = getattr(args, "via", "efivarfs")
+    ih_info = None
+    if via == "ihisi":
+        ih = _load_ihisi()
+        ov = getattr(args, "func_override", None)
+        if ov is not None:
+            try:
+                port, psrc = ih.find_smi_port()
+                if port is None:
+                    port, psrc = ih.find_smi_port_from_mem()
+            except ih.IhisiError as e:
+                port, psrc = ih.FALLBACK_PORT, "回退默认值（%s）" % e
+            ih_info = {"port": port, "port_source": psrc, "main_func": ov,
+                       "tag_phys": None, "aligned": True}
+        else:
+            ih_info = ih.discover(verbose=False)
+        say("通道      IHISI SMI   端口 0x%02X   主号 0x%02X"
+            % (ih_info["port"], ih_info["main_func"]))
     say("探针目标  %s / %s" % (guid, args.record))
     say("数据长度  %d 字节  attrs=0x%08x (%s)" % (len(data), attrs, _attr_words(attrs)))
     say("")
@@ -1279,7 +1363,7 @@ def cmd_probe(args):
             say("已取消")
             return EXIT_PATCH
     try:
-        cleared = write_var(guid, args.record, data)
+        cleared = write_var(guid, args.record, data, via=via, info=ih_info)
     except RuntimeError as e:
         say("")
         say(str(e))
@@ -1287,12 +1371,14 @@ def cmd_probe(args):
         say("VERDICT: WRITE_BLOCKED")
         _save_channel_state({args.record: "WRITE_BLOCKED"})
         return EXIT_CHANNEL_DENIED
-    say("immutable 标志: %s" % ("已清除" if cleared else "无需清除"))
+    say("immutable 标志: %s" % ("已清除" if cleared else "无需清除（IHISI 通道不碰它）"
+                               if via == "ihisi" else "无需清除"))
     _a2, after = read_var(guid, args.record)
     if after == data:
         say("回读比对: 完全一致")
         say("")
-        say("VERDICT: WRITE_OK —— efivarfs 通道可用，可以应用补丁")
+        say("VERDICT: WRITE_OK —— %s 通道可用，可以应用补丁"
+            % ("IHISI SMI" if via == "ihisi" else "efivarfs"))
         _save_channel_state({args.record: "WRITE_OK"})
         return EXIT_OK
     diff = [i for i in range(min(len(data), len(after))) if data[i] != after[i]]
@@ -1524,11 +1610,160 @@ def cmd_export(args):
     return EXIT_OK
 
 
+def cmd_ihisi(args):
+    """IHISI 通道的只读探测与连通性测试。
+
+    三个动作按风险从低到高：
+      --discover   只读 /dev/mem 与 ACPI 表，不发 SMI
+      --ping       发子功能 0x10（IsSupportIhisi），不改任何状态
+      --dry-run-patch  拼好报文、拿到物理地址，但不发 SMI
+    """
+    ih = _load_ihisi()
+    if not (args.discover or args.ping or args.dry_run_patch):
+        args.discover = True
+
+    say("insyde-nvram ihisi —— 探测通道（不会修改任何 NVRAM）")
+    say("时间      %s" % time.strftime("%Y-%m-%d %H:%M:%S"))
+
+    # 端口先单独拿：即使主功能号失败，也要把已经确定的信息报出来
+    try:
+        port, port_src = ih.find_smi_port()
+        if port is None:
+            try:
+                port, port_src = ih.find_smi_port_from_mem()
+            except ih.IhisiError as e:
+                port, port_src = ih.FALLBACK_PORT, "回退默认值（%s）" % e
+    except ih.IhisiError as e:
+        port, port_src = ih.FALLBACK_PORT, "回退默认值（%s）" % e
+    say("SMI 端口   0x%02X   （%s）" % (port, port_src))
+
+    # 主功能号
+    info = {"port": port, "port_source": port_src}
+    if args.func_override is not None:
+        info["main_func"] = args.func_override
+        info["tag_phys"] = None
+        say("IHISI 主号 0x%02X   （命令行 --func 指定，未读 F 段）" % args.func_override)
+    else:
+        try:
+            info.update(ih.probe_func())
+        except ih.IhisiError as e:
+            say("")
+            say("主功能号  未取到")
+            for ln in str(e).splitlines():
+                say("  " + ln if ln.strip() else "")
+            say("")
+            say("可以先用驱动自己的回退值试连通性（只发 0x10，不改任何状态）：")
+            say("  sudo ./insyde-nvram ihisi --ping --func 0x%02X" % ih.FALLBACK_FUNC)
+            return EXIT_CHANNEL_DENIED
+        say("IHISI 主号 0x%02X   （$IHISI 标签物理 0x%05X，取标签 +6）"
+            % (info["main_func"], info["tag_phys"]))
+        if not info.get("aligned", True):
+            say("注意      标签偏移不是 0x10 的整数倍，驱动的原始扫描会漏掉它。")
+
+    if "回退" in info["port_source"]:
+        say("注意      端口不是实测值。SMM 收到错误端口的 out 不会有任何反应，")
+        say("          若 --ping 无响应，先解决 ACPI 表读不到的问题。")
+
+    if args.ping:
+        say("")
+        say("发送子功能 0x10（IsSupportIhisi），不改任何状态 …")
+        try:
+            st, res, untouched = ih.ping(info)
+        except ih.IhisiError as e:
+            die(EXIT_CHANNEL_DENIED, "SMI 调用失败: %s" % e)
+        say("  回写寄存器 %s" % " ".join("%s=0x%X" % (k, v) for k, v in sorted(res.items())))
+        if st == 0:
+            say("  判定: 通道存在（AL == 0，与驱动 0x13F42 的判据一致）")
+            say("  下一步: sudo ./insyde-nvram probe --record Setup --via ihisi%s"
+                % (" --func 0x%02X" % info["main_func"]))
+        elif untouched:
+            say("  判定: SMM 没有响应 —— 寄存器原样返回（AL=0x%02X，仍是输入值），" % st)
+            say("        说明 out 0x%02X 之后 CPU 没有进 SMM 处理这条命令。" % info["port"])
+            say("        这不是「通道返回错误码」，是「这条 SMI 没人接」。可能原因：")
+            say("          1) 主功能号在此平台不是 0x%02X（试 --func 0xEF）" % info["main_func"])
+            say("          2) 端口不是 0x%02X（跑 tools/fseg_scan.py --all 复核）" % info["port"])
+            say("          3) SMM 只接受 boot-services 阶段的请求，从 OS 里发无效")
+            return EXIT_CHANNEL_DENIED
+        else:
+            say("  判定: SMM 有响应，但 AL = 0x%02X（非 0 = 拒绝）" % st)
+            say("        通道存在但拒绝了这次请求，多半是主功能号或子功能不对。")
+            return EXIT_CHANNEL_DENIED
+
+    if args.dry_run_patch:
+        p = parse_patch(args.dry_run_patch)
+        if not p["ok"]:
+            die(EXIT_PATCH, "补丁有问题: %s" % p["err"])
+        live, attrs = {}, {}
+        for rec in p["records"]:
+            try:
+                attrs[rec], data = read_var(p["guid"], rec)
+            except RuntimeError as e:
+                die(EXIT_ENGINE, str(e))
+            live[rec] = data
+        try:
+            target = build_target(p, live)
+        except RuntimeError as e:
+            die(EXIT_SANITY, str(e))
+        for rec in p["records"]:
+            r = ih.write_variable(p["guid"], rec, target[rec], attrs[rec],
+                                  info=info, dry_run=True)
+            say("")
+            say("记录 %s" % rec)
+            say("  报文      %d 字节（名称 %d 字节 + 数据 %d 字节）"
+                % (r["packet_len"], r["namelen"], len(target[rec])))
+            say("  ESI       0x%08X  （报文物理基址）" % r["esi"])
+            say("  EDI       0x%08X  （= ESI + 0x10 + %d，指向 $H2O）" % (r["edi"], r["namelen"]))
+            say("  属性      0x%08X" % attrs[rec])
+            off = r["packet_len"] - len(target[rec])
+            for c in p["changes"]:
+                say("  改动      报文 +0x%03X  0x%02X → 0x%02X"
+                    % (off + c["off"], target[rec][c["off"]] ^ 0, c["to"]))
+            say("  报文前 48 字节 %s" % r["packet"][:48].hex(" "))
+        say("")
+        say("未发送任何 SMI。确认无误后去掉 --dry-run-patch，改用：")
+        say("  sudo ./insyde-nvram apply %s --via ihisi" % args.dry_run_patch)
+    return EXIT_OK
+
+
 def cmd_apply(args):
+    via = getattr(args, "via", "efivarfs")
     logpath = os.path.join(LOGDIR, "apply_%s.txt" % _stamp())
-    say("insyde-nvram apply —— 通过 efivarfs 写入补丁字节")
+    say("insyde-nvram apply —— 写入补丁字节（通道：%s）"
+        % ("IHISI SMI" if via == "ihisi" else "efivarfs / SetVariable"))
     say("时间      %s" % time.strftime("%Y-%m-%d %H:%M:%S"))
     gate_root()
+
+    ih_info = None
+    if via == "ihisi":
+        ih = _load_ihisi()
+        ov = getattr(args, "func_override", None)
+        if ov is not None:
+            # 端口照读，主功能号用命令行给的（绕开 F 段扫描）
+            try:
+                port, psrc = ih.find_smi_port()
+                if port is None:
+                    port, psrc = ih.find_smi_port_from_mem()
+            except ih.IhisiError as e:
+                port, psrc = ih.FALLBACK_PORT, "回退默认值（%s）" % e
+            ih_info = {"port": port, "port_source": psrc, "main_func": ov,
+                       "tag_phys": None, "aligned": True}
+        else:
+            try:
+                ih_info = ih.discover(verbose=False)
+            except ih.IhisiError as e:
+                flush_log(logpath)
+                die(EXIT_CHANNEL_DENIED,
+                    "IHISI 通道不可用: %s\n"
+                    "  这一步只读物理内存与 ACPI 表，不改任何东西。常见原因：\n"
+                    "    - 没以 root 运行（需要 /dev/mem 与 CAP_SYS_RAWIO）\n"
+                    "    - 内核开着 CONFIG_STRICT_DEVMEM 且拦了 F 段\n"
+                    "    - 这台机器用的不是 Insyde H2O（没有 $IHISI 标签）\n"
+                    "  本机实测 F 段里就没有标签，可以直接指定：\n"
+                    "    --func 0x64   （固件数据里确认的值）" % e)
+        say("SMI 端口   0x%02X   （%s）" % (ih_info["port"], ih_info["port_source"]))
+        say("IHISI 主号 0x%02X   %s" % (ih_info["main_func"],
+                                       "（命令行 --func 指定）" if ov is not None
+                                       else "（F 段 $IHISI 标签 +6）"))
 
     p = parse_patch(args.patch)
     if not p["ok"]:
@@ -1598,10 +1833,15 @@ def cmd_apply(args):
         say("")
         say("写入      %s …" % rec)
         try:
-            cleared = write_var(p["guid"], rec, target[rec])
+            cleared = write_var(p["guid"], rec, target[rec], via=via, info=ih_info)
         except ChannelDenied as e:
             say("   失败: %s" % e)
             flush_log(logpath)
+            if via == "ihisi":
+                die(EXIT_CHANNEL_DENIED,
+                    "IHISI 通道被拒（退出码 13）。既然已经走了 SMI 还被拒，"
+                    "通常是报文被 SMM 判为非法：先用 `sudo ./insyde-nvram ihisi --ping` "
+                    "确认主功能号对不对，再看日志里返回的状态字节。")
             die(EXIT_CHANNEL_DENIED,
                 "通道被拦（退出码 13）。先跑 `sudo insyde-nvram probe --scan` 确认是"
                 "整条 efivarfs 被封、还是只有这条变量被写保护，然后按 README 第 9 节换通道。")
@@ -1741,11 +1981,27 @@ def build_parser():
     s.add_argument("patch")
     s.set_defaults(func=cmd_check)
 
+    s = sub.add_parser("ihisi", help="IHISI SMI 通道：只读探测与连通性测试（不改 NVRAM）")
+    s.add_argument("--discover", action="store_true", help="读 SMI 端口与 IHISI 主功能号")
+    s.add_argument("--ping", action="store_true", help="发子功能 0x10，确认通道响应")
+    s.add_argument("--dry-run-patch", metavar="PATCH",
+                   help="按补丁构造报文并打印物理地址，但不发 SMI")
+    s.add_argument("--func", dest="func_override", type=lambda x: int(x, 0),
+                   metavar="N",
+                   help="跳过 F 段扫描，直接用这个主功能号（如 0xEF）；只影响本次")
+    s.set_defaults(func=cmd_ihisi)
+
     s = sub.add_parser("apply", help="应用补丁（会修改 NVRAM）")
     s.add_argument("patch")
     s.add_argument("--dry-run", action="store_true", help="跑完所有门禁但不写入")
     s.add_argument("--yes", action="store_true", help="跳过交互确认")
     s.add_argument("--force", action="store_true", help="一次性跳过所有门禁（危险）")
+    s.add_argument("--via", choices=["efivarfs", "ihisi"], default="efivarfs",
+                   help="写入通道：efivarfs=内核 SetVariable（默认）；"
+                        "ihisi=直接向固件发 SMI，绕过 SetVariable 写保护（需 root）")
+    s.add_argument("--func", dest="func_override", type=lambda x: int(x, 0),
+                   metavar="N",
+                   help="ihisi 通道下直接指定 IHISI 主功能号（F 段扫不到标签时用，如 0x64）")
     s.set_defaults(func=cmd_apply)
 
     s = sub.add_parser("restore", help="按 undo 副本逐字节回滚")
@@ -1773,6 +2029,10 @@ def build_parser():
     s.add_argument("--scan", action="store_true",
                    help="扫描全部 Setup 类变量 + 临时变量，判断是整条通道被封还是单变量被保护")
     s.add_argument("--yes", action="store_true")
+    s.add_argument("--via", choices=["efivarfs", "ihisi"], default="efivarfs",
+                   help="用哪条通道做原样写回：efivarfs（默认）或 ihisi（SMI）")
+    s.add_argument("--func", dest="func_override", type=lambda x: int(x, 0),
+                   metavar="N", help="ihisi 通道下的 IHISI 主功能号（F 段扫不到时用，如 0x64）")
     s.set_defaults(func=cmd_probe)
 
     return ap

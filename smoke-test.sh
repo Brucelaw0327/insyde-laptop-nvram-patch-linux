@@ -3,12 +3,17 @@
 set -u
 cd "$(dirname "$0")" || exit 1
 TMP=$(mktemp -d)
-pass=0; fail=0
+pass=0; fail=0; skip=0
 
 chk() { # chk 描述 期望退出码 实际退出码
     if [ "$2" = "$3" ]; then printf '  ok   %-42s (exit %s)\n' "$1" "$3"; pass=$((pass+1));
     else printf '  FAIL %-42s 期望 %s 实际 %s\n' "$1" "$2" "$3"; fail=$((fail+1)); fi
 }
+
+skp() { printf '  skip %-42s (需要 root)\n' "$1"; skip=$((skip+1)); }
+
+IS_ROOT=0
+[ "$(id -u)" -eq 0 ] && IS_ROOT=1
 
 cat > "$TMP/ok.patch" <<'EOF'
 NAME     = smoke ok
@@ -83,20 +88,29 @@ echo "== 补丁解析错误 =="
 ./insyde-nvram check "$TMP/nonexistent.patch" >/dev/null 2>&1; chk "文件不存在" 2 $?
 
 echo "== apply 门禁 =="
-./insyde-nvram apply "$TMP/ok.patch" --dry-run >/dev/null 2>&1;      chk "apply --dry-run 全部通过" 0 $?
-./insyde-nvram apply "$TMP/bad-from.patch" --dry-run >/dev/null 2>&1; chk "apply 取值门禁"          8 $?
-./insyde-nvram apply "$TMP/mixed.patch" --dry-run >/dev/null 2>&1;    chk "apply 补丁解析"           2 $?
+# apply 第一道门就是 root（exit 3），非 root 下这 5 项测不出门禁本身
+if [ "$IS_ROOT" -eq 1 ]; then
+    ./insyde-nvram apply "$TMP/ok.patch" --dry-run >/dev/null 2>&1;      chk "apply --dry-run 全部通过" 0 $?
+    ./insyde-nvram apply "$TMP/bad-from.patch" --dry-run >/dev/null 2>&1; chk "apply 取值门禁"          8 $?
+    ./insyde-nvram apply "$TMP/mixed.patch" --dry-run >/dev/null 2>&1;    chk "apply 补丁解析"           2 $?
 
-echo "== 缺少 machine.txt =="
-mv machine.txt "$TMP/machine.txt.bak"
-./insyde-nvram apply "$TMP/ok.patch" --dry-run >/dev/null 2>&1;       chk "缺 machine.txt"  6 $?
-mv "$TMP/machine.txt.bak" machine.txt
+    echo "== 缺少 machine.txt =="
+    mv machine.txt "$TMP/machine.txt.bak"
+    ./insyde-nvram apply "$TMP/ok.patch" --dry-run >/dev/null 2>&1;       chk "缺 machine.txt"  6 $?
+    mv "$TMP/machine.txt.bak" machine.txt
 
-echo "== 身份不匹配 =="
-cp machine.txt "$TMP/machine.txt.keep"
-sed -i 's/^BIOS=.*/BIOS=WRONGVERSION/' machine.txt
-./insyde-nvram apply "$TMP/ok.patch" --dry-run >/dev/null 2>&1;       chk "身份门禁"  7 $?
-cp "$TMP/machine.txt.keep" machine.txt
+    echo "== 身份不匹配 =="
+    cp machine.txt "$TMP/machine.txt.keep"
+    sed -i 's/^BIOS=.*/BIOS=WRONGVERSION/' machine.txt
+    ./insyde-nvram apply "$TMP/ok.patch" --dry-run >/dev/null 2>&1;       chk "身份门禁"  7 $?
+    cp "$TMP/machine.txt.keep" machine.txt
+else
+    skp "apply --dry-run 全部通过"
+    skp "apply 取值门禁"
+    skp "apply 补丁解析"
+    skp "缺 machine.txt"
+    skp "身份门禁"
+fi
 
 echo "== 离线导出 =="
 ./insyde-nvram export "$TMP/ok.patch" --out "$TMP/exp" >/dev/null 2>&1;      chk "export 正常"        0 $?
@@ -127,7 +141,50 @@ grep -q '^RECORDS  = Setup$' "$TMP/d1.patch" && chk "补丁 RECORDS 只含变动
     && chk "两个记录都变 → 拆成 2 份" 0 0 || chk "两个记录都变 → 拆成 2 份" 0 1
 ./insyde-nvram check "$TMP/d2.Setup.patch" >/dev/null 2>&1; chk "拆出的补丁可被 check 解析" 0 $?
 
+echo "--- IHISI 通道（SMI 写入，不依赖 H2OUVE）---"
+python3 ihisi.py selftest >/dev/null 2>&1; chk "报文布局与校验和自检" 0 $?
+
+python3 - "$PWD" >/dev/null 2>&1 <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+import ihisi
+pid = "A04A27F4-DF00-4D42-B552-39511302113D"
+p = ihisi.build_packet(pid, "Setup", b"\x00" * 700, 0x07)
+assert len(p) == 0x40 + 12 + 700, len(p)
+assert p[0x10:0x1C] == "Setup".encode("utf-16-le") + b"\x00\x00"
+assert p[0x2C:0x30] == b"$H2O" and p[0x30:0x34] == b"$Var" and p[0x34:0x38] == b"$Tbl"
+assert p[0x49] == 0x10
+assert ihisi.packet_checksum(b"\x01\x02\x03") == (-6) & 0xFFFF
+assert ihisi.guid_bytes_le("8BE4DF61-93CA-11D2-AA0D-00E098032B8C").hex() == "61dfe48bca93d211aa0d00e098032b8c"
+PY
+chk "报文 760 字节 / 三魔数 / GUID 混合端序" 0 $?
+
+./insyde-nvram ihisi --help >/dev/null 2>&1; chk "ihisi --help 可用" 0 $?
+
+if [ "$(id -u)" -ne 0 ]; then
+    ./insyde-nvram ihisi --discover >/dev/null 2>&1
+    chk "非 root 探测 → 通道被拦(13)" 13 $?
+    ./insyde-nvram apply "$TMP/ok.patch" --via ihisi --dry-run >/dev/null 2>&1
+    chk "非 root apply --via ihisi → 3" 3 $?
+fi
+
+if [ -f ihisi/ihisi_smi.c ]; then
+    chk "C 调用器源码存在" 0 0
+    if command -v cc >/dev/null 2>&1 || command -v gcc >/dev/null 2>&1; then
+        CCB="$(command -v cc || command -v gcc)"
+        "$CCB" -O2 -Wall -o "$TMP/ihisi_smi" ihisi/ihisi_smi.c 2>/dev/null
+        chk "C 调用器可编译（-Wall 无错）" 0 $?
+        "$TMP/ihisi_smi" 2>/dev/null; chk "参数缺失时退出码 1" 1 $?
+    fi
+else
+    chk "C 调用器源码存在" 0 1
+fi
+
 echo
-echo "通过 $pass / 失败 $fail"
+if [ "$skip" -gt 0 ]; then
+    echo "通过 $pass / 失败 $fail / 跳过 $skip（跳过的需要 root：sudo bash smoke-test.sh）"
+else
+    echo "通过 $pass / 失败 $fail"
+fi
 rm -rf "$TMP"
 [ "$fail" -eq 0 ]

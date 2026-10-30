@@ -16,3 +16,30 @@ fw/
 
 __pycache__/
 *.pyc
+
+# IHISI C 调用器（由 ihisi.py 自动从 .c 编译，别提交二进制）
+ihisi/ihisi_smi
+
+# IO 端口探测器（由 port_peek.py 自动从 .c 编译，同上）
+tools/port_peek
+
+# SMI 状态探针（同 ihisi_smi，现场编译不提交二进制）
+tools/smi_probe
+
+# 内核模块构建产物
+kernel/*.ko
+kernel/*.o
+kernel/*.mod*
+kernel/*.cmd
+kernel/Module.symvers
+kernel/modules.order
+kernel/ihisi_diag.txt
+
+# 运行时产物：用户自己的 BIOS 设置备份（隐私，绝不入库）
+setup_backup_*.bin
+*.log
+
+# 本机固件逆向产物（反汇编/切片，含厂商固件代码，不入库）
+fw_rea/
+ihisi_diag.txt
+h2ouve-re-local/
